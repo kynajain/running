@@ -1,0 +1,13 @@
+.env
+.env.*
+node_modules/
+logs/
+state.json
+*.tmp
+*.log
+.git/
+.gitignore
+Dockerfile
+docker-compose.yml
+smoke.sh
+README.md

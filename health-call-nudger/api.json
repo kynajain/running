@@ -1,11 +1,37 @@
 {
   "service": "health-call-nudger",
-  "description": "Accepts a stress score and places an outbound coaching phone call via the ElevenLabs Conversational AI Twilio integration.",
+  "description": "Safety check-in tool for runners. Receives biometric data from Terra webhooks (Oura via Terra's server-side integration) and places a calm outbound phone call via the ElevenLabs Conversational AI Twilio integration when stress indicators spike.",
+  "notAnEmergencyService": "Escalation to an emergency contact exists but is off by default (escalationEnabled). Even when on, Terra's stress score is a recalculated value rather than a live reading, so this is not real-time emergency detection.",
+  "auth": {
+    "public": ["POST /webhook/terra", "GET /health", "GET /"],
+    "admin": ["POST /nudge", "POST /test-call", "POST /acknowledge", "PATCH /config"],
+    "scheme": "Admin routes require an x-admin-token header matching ADMIN_TOKEN, compared in constant time. When ADMIN_TOKEN is unset they accept loopback connections only. There is no bypass flag: these routes place real calls to the runner and her emergency contact.",
+    "rejections": "401 with { status: 'error', error: 'unauthorised' }, logged with source IP"
+  },
+  "webhookHardening": {
+    "signature": "strict, on the raw body, before parsing",
+    "maxBodyBytes": 3145728,
+    "rateLimit": "60 requests per minute per IP; 429 above that. Set TRUST_PROXY=1 behind a proxy so real client IPs are used.",
+    "logging": "every rejection is logged with source IP and reason"
+  },
   "endpoints": [
     {
       "method": "POST",
+      "path": "/webhook/terra",
+      "description": "Terra payload receiver. Verifies the terra-signature header (HMAC-SHA256 over `<timestamp>.<raw body>`, 300s window) before anything else, then acknowledges immediately and processes asynchronously because Terra retries on any non-200. Handles activity, daily and body payloads; idempotent across Terra's resends for the same period.",
+      "headers": { "terra-signature": "t=<unix_seconds>,v1=<hex_hmac> (required)" },
+      "body": "Terra webhook payload: { type, user: { user_id, provider }, data: [ ... ] }",
+      "responses": {
+        "200": "{ \"status\": \"received\" } — acknowledged; processing continues in the background",
+        "401": "{ \"status\": \"error\", \"error\": string } — missing, malformed, stale or non-matching signature",
+        "413": "{ \"status\": \"error\", \"error\": string } — body over 3 MB",
+        "429": "{ \"status\": \"error\", \"error\": \"rate limit exceeded\" }"
+      }
+    },
+    {
+      "method": "POST",
       "path": "/nudge",
-      "description": "Trigger a nudge call. Skipped when the score is below stressThreshold or a call was placed within cooldownSeconds. Responds immediately; the call is placed asynchronously.",
+      "description": "Manual trigger. Skipped when the score is below stressThreshold or a call was placed within cooldownSeconds. Responds immediately; the call is placed asynchronously.",
       "body": {
         "score": "number (0-100, required)",
         "context": "string (optional, short description surfaced in the spoken message)"
@@ -18,36 +44,65 @@
     {
       "method": "POST",
       "path": "/test-call",
-      "description": "Place a call directly with the supplied message, bypassing scoring, threshold and cooldown. For verifying the ElevenLabs/Twilio connection in isolation. Waits for the ElevenLabs response.",
+      "description": "Place a call directly with the supplied message, bypassing scoring, threshold and cooldown. For verifying the ElevenLabs/Twilio connection in isolation. Waits for ElevenLabs to accept the call, then tracks the outcome in the background.",
       "body": { "message": "string (required, non-empty)" },
       "responses": {
-        "200": "{ \"status\": \"ok\", \"result\": object }",
+        "200": "{ \"status\": \"ok\", \"conversationId\": string|null }",
         "400": "{ \"status\": \"error\", \"error\": string }",
         "502": "{ \"status\": \"error\", \"stage\": \"elevenlabs_call\", \"error\": string, \"details\": object }"
       }
     },
     {
+      "method": "POST",
+      "path": "/acknowledge",
+      "description": "Records that the runner is fine. Cancels a pending escalation that is still inside its delay window.",
+      "body": "none",
+      "responses": { "200": "{ \"status\": \"ok\", \"acknowledgedAt\": string }" }
+    },
+    {
+      "method": "GET",
+      "path": "/health",
+      "description": "Platform health check, independent of call state: uptime and whether the configuration is complete. Use this for container and load-balancer probes, not /status.",
+      "responses": {
+        "200": "{ \"status\": \"ok\", \"uptimeSeconds\": number, \"configValid\": boolean, \"problems\": string[] }"
+      }
+    },
+    {
       "method": "GET",
       "path": "/status",
-      "description": "Current counters and readiness.",
+      "description": "Counters, the last call outcome, and readiness.",
       "responses": {
-        "200": "{ \"nudgeCount\": number, \"lastNudgeAt\": string|null, \"cooldownActive\": boolean, \"callingConfigured\": boolean, \"missingEnv\": string[] }"
+        "200": "{ \"nudgeCount\": number, \"lastNudgeAt\": string|null, \"lastCallOutcome\": object|null, \"cooldownActive\": boolean, \"callingConfigured\": boolean, \"webhookConfigured\": boolean, \"missingEnv\": string[], \"escalation\": object }"
+      },
+      "escalation": {
+        "fields": "enabled, configured, missingEnv, lastEscalationAt, acknowledgedAt, recent",
+        "recent": "the last 10 audit entries: { at, verdict, reason, triggeringScore, conversation ids, outcome }",
+        "verdicts": "pending | called | cancelled | skipped | failed | outcome"
+      },
+      "lastCallOutcome": {
+        "outcome": "answered | unanswered | failed | unknown",
+        "stage": "which stage the call reached or failed at: message_generation | elevenlabs_call | call_outcome | complete",
+        "fields": "at, conversationId, status, callDurationSecs, terminationReason, error, details (present depending on outcome)"
       }
     },
     {
       "method": "GET",
       "path": "/config",
       "description": "Read non-secret config.",
-      "responses": { "200": "{ \"stressThreshold\": number, \"cooldownSeconds\": number, \"listenerPort\": number }" }
+      "responses": {
+        "200": "{ \"stressThreshold\": number, \"cooldownSeconds\": number, \"listenerPort\": number, \"escalationEnabled\": boolean, \"escalationDelaySeconds\": number }"
+      }
     },
     {
       "method": "PATCH",
       "path": "/config",
-      "description": "Update non-secret config and persist to config.json. Secrets are never readable or writable here. listenerPort changes take effect on restart.",
+      "description": "Update non-secret config and persist to config.json. Secrets are never readable or writable here; any other key is rejected. listenerPort changes take effect on restart.",
       "body": {
         "stressThreshold": "number (optional)",
         "cooldownSeconds": "number (optional)",
-        "listenerPort": "number (optional)"
+        "listenerPort": "number (optional)",
+        "escalationEnabled": "boolean (optional) — turning this on means an unanswered check-in will call a third party",
+        "escalationDelaySeconds": "number (optional)"
       },
       "responses": {
         "200": "{ \"status\": \"ok\", \"config\": object }",
@@ -65,16 +120,38 @@
     "ELEVENLABS_API_KEY",
     "ELEVENLABS_AGENT_ID",
     "ELEVENLABS_PHONE_NUMBER_ID",
-    "TO_NUMBER"
+    "TO_NUMBER",
+    "TERRA_SIGNING_SECRET",
+    "ELEVENLABS_ESCALATION_AGENT_ID (escalation only)",
+    "EMERGENCY_CONTACT_NUMBER (escalation only)",
+    "EMERGENCY_CONTACT_NAME (escalation only)",
+    "ADMIN_TOKEN (shared secret for the admin routes)",
+    "BIND_ADDRESS (default 127.0.0.1, 0.0.0.0 in the container)",
+    "STATE_PATH (override the state file location)",
+    "TRUST_PROXY (1 when a proxy sets X-Forwarded-For)"
   ],
+  "escalation": {
+    "default": "disabled (escalationEnabled false) — must be switched on deliberately",
+    "flow": "unanswered check-in call -> wait escalationDelaySeconds -> re-check whether the runner answered late or hit /acknowledge -> only if still unanswered, one call to EMERGENCY_CONTACT_NUMBER using ELEVENLABS_ESCALATION_AGENT_ID",
+    "rateLimit": "at most one escalation per cooldownSeconds window, however many Terra payloads arrive for the same period",
+    "agent": "a separate ElevenLabs agent; the third-party script does not share the runner's persona",
+    "script": "factual and non-alarming: automated check-in, elevated wearable reading, no answer, may well be nothing. It does not claim an emergency or tell the contact to call emergency services.",
+    "consent": "the contact is called automatically and must have consented in advance",
+    "audit": "every attempt, including the ones that never dial, is logged and persisted in state.escalationLog with timestamp, triggering score and outcome"
+  },
+  "scoring": {
+    "source": "data_enrichment.stress from the Terra payload only; returns null and skips when absent",
+    "callDurationCapSeconds": 90,
+    "notImplemented": "exertion-aware scoring. Raw heart rate is not a valid stress signal for a runner — elevated HR is the expected state. Real logic needs HRV against a personal baseline, or HR relative to pace."
+  },
   "upstream": {
     "provider": "ElevenLabs Conversational AI",
-    "endpoint": "POST https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
+    "outboundCall": "POST https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
+    "conversationStatus": "GET https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}",
     "auth": "xi-api-key header"
   },
   "outOfScope": [
-    "health-data ingestion (Terra, Apple Health, wearables)",
-    "LLM-based message generation",
-    "decision-maker / monitor service integration"
+    "Apple Health and Terra's Mobile SDK (no web API; would require an on-device app)",
+    "LLM-based message generation"
   ]
 }

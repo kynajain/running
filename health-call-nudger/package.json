@@ -7,7 +7,9 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node health_call_nudger.js"
+    "start": "node health_call_nudger.js",
+    "tunnel": "node tunnel.js",
+    "smoke": "bash smoke.sh"
   },
   "license": "ISC",
   "dependencies": {

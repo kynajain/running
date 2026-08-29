@@ -1,0 +1,27 @@
+services:
+  health-call-nudger:
+    build: .
+    container_name: health-call-nudger
+    restart: unless-stopped
+    # Secrets are mounted, never baked into the image.
+    env_file: .env
+    environment:
+      BIND_ADDRESS: 0.0.0.0
+      # Set to 1 only when a proxy in front of this container sets
+      # X-Forwarded-For, otherwise the webhook rate limit sees one IP.
+      TRUST_PROXY: "0"
+    ports:
+      # Published on loopback: put an HTTPS proxy in front for Terra.
+      - "127.0.0.1:4300:4300"
+    volumes:
+      - ./logs:/app/logs
+      - nudger-state:/app/data
+      - ./config.json:/app/config.json
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:4300/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  nudger-state:
