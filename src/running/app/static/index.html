@@ -234,18 +234,24 @@
         const runnerSessionId = incident.pending_session_id;
         let engagementReported = false;
         let sessionRegistered = false;
-        let pendingEngagement = false;
+        let engagementPending = false;
+        let engagementInFlight = false;
         reportEngagement = async () => {
-          if (engagementReported) return;
-          engagementReported = true;
-          if (!sessionRegistered) {
-            pendingEngagement = true;
-            return;
+          engagementPending = true;
+          if (!sessionRegistered || engagementInFlight || engagementReported) return;
+          engagementInFlight = true;
+          try {
+            await json(
+              `/api/incident/${incident.incident_id}/session/${runnerSessionId}/engagement`,
+              {},
+            );
+            engagementPending = false;
+            engagementReported = true;
+          } catch (error) {
+            log(`Could not report engagement: ${error.message}`);
+          } finally {
+            engagementInFlight = false;
           }
-          await json(
-            `/api/incident/${incident.incident_id}/session/${runnerSessionId}/engagement`,
-            {},
-          ).catch((error) => log(`Could not report engagement: ${error.message}`));
         };
 
         const voice = await micAvailable();
@@ -287,6 +293,7 @@
               els.compose.classList.remove("on");
               els.trigger.disabled = false;
               conversation = null;
+              if (engagementPending && !engagementReported) reportEngagement();
               reportEngagement = async () => {};
               if (incident) {
                 json(`/api/incident/${incident.incident_id}`)
@@ -325,7 +332,7 @@
           conversation_id: conversationId,
         }).then(() => {
           sessionRegistered = true;
-          if (pendingEngagement) reportEngagement();
+          if (engagementPending && !engagementReported) reportEngagement();
         }).catch((error) => log(`Could not register the session: ${error.message}`));
       }
 

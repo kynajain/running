@@ -114,3 +114,11 @@ The in-memory incident state machine, credential minting, and mocked HTTP
 tests have been exercised locally. The in-app runner conversation was also
 exercised against a real ElevenLabs account in the browser. No live Twilio SMS
 has been sent by this code.
+
+## Deployment
+
+Run the app as one long-lived process, such as a single uvicorn process or
+container. Serverless or multi-instance hosting is unsupported: the delayed
+escalation timer and incident state are in-process, so serverless execution
+would silently break escalation. Supporting those deployments requires a
+durable store and scheduler first.
