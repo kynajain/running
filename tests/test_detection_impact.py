@@ -146,3 +146,19 @@ def test_stillness_rejects_a_hole_in_the_window() -> None:
     ]
 
     assert detect_impact(gapped) is None
+
+
+def test_recording_ending_just_before_the_deadline_is_not_a_fall() -> None:
+    """Absent evidence through the window is not evidence of stillness."""
+
+    truncated = [
+        *steady(0, 3, upright=True, jitter=0.25),
+        MotionSample(timestamp=at(3.0), x=0.0, y=0.0, z=0.1),
+        MotionSample(timestamp=at(3.05), x=0.0, y=0.0, z=6.0),
+        *[
+            MotionSample(timestamp=at(3.53 + step * 0.07), x=1.0, y=0.0, z=0.0)
+            for step in range(int((10.2 - 3.53) / 0.07))
+        ],
+    ]
+
+    assert detect_impact(truncated) is None

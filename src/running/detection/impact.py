@@ -139,9 +139,9 @@ def _stillness(
 ) -> timedelta | None:
     """Duration of near-zero motion from ``start``, or ``None`` if too short.
 
-    The whole interval must be covered by readings that are all at rest.
-    Coverage is judged by gaps rather than by a sample landing exactly on the
-    deadline, which real timestamps rarely do.
+    The whole interval must be covered by readings that are all at rest, and
+    the stream has to reach past the deadline. Coverage is judged by the gaps
+    between readings, since real timestamps rarely land on the deadline.
     """
 
     deadline = start + limit
@@ -153,7 +153,14 @@ def _stillness(
         if abs(sample.magnitude - 1.0) > tolerance:
             return None
 
-    edges = [start, *(sample.timestamp for sample in window), deadline]
+    beyond = next(
+        (sample.timestamp for sample in samples if sample.timestamp >= deadline),
+        None,
+    )
+    if beyond is None:
+        return None
+
+    edges = [start, *(sample.timestamp for sample in window), beyond]
     if any(later - earlier > MAX_GAP for earlier, later in zip(edges, edges[1:], strict=False)):
         return None
     return limit
