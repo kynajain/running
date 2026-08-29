@@ -1,7 +1,7 @@
 """Protocols and registries for pluggable sources and sinks."""
 
 from collections.abc import AsyncIterator, Callable, Sequence
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, runtime_checkable
 
 from running.models import HealthSample, TimeWindow, WorkoutSession
 
@@ -20,6 +20,11 @@ class Sink(Protocol):
     async def write_samples(self, batch: Sequence[HealthSample]) -> int: ...
 
     async def write_workouts(self, batch: Sequence[WorkoutSession]) -> int: ...
+
+
+@runtime_checkable
+class ClosableSink(Protocol):
+    async def aclose(self) -> None: ...
 
 
 ConnectorFactory = Callable[..., HealthConnector]
