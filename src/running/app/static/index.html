@@ -217,6 +217,8 @@
         setStatus("Incident flagged. Connecting the safety assistant…", "alert");
         log("Tracker flagged a possible incident. Starting an in-app call.");
 
+        const voice = await micAvailable();
+
         try {
           const triggered = await json("/api/trigger", {
             message: "Your watch flagged a possible fall during your run.",
@@ -237,7 +239,7 @@
         let engagementPending = false;
         let engagementInFlight = false;
         let engagementRequest = null;
-        reportEngagement = () => {
+        const ownReportEngagement = () => {
           engagementPending = true;
           if (engagementInFlight || engagementRequest) return engagementRequest;
           if (!sessionRegistered || engagementReported) return null;
@@ -259,8 +261,8 @@
           })();
           return engagementRequest;
         };
+        reportEngagement = ownReportEngagement;
 
-        const voice = await micAvailable();
         let session;
         try {
           session = voice
@@ -301,8 +303,8 @@
               conversation = null;
               const finishDisconnect = async () => {
                 if (engagementRequest) await engagementRequest;
-                if (engagementPending && !engagementReported) await reportEngagement();
-                reportEngagement = async () => {};
+                if (engagementPending && !engagementReported) await ownReportEngagement();
+                if (reportEngagement === ownReportEngagement) reportEngagement = async () => {};
               };
               finishDisconnect();
               if (incident) {
