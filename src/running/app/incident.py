@@ -48,6 +48,11 @@ class TriggerPayload(BaseModel):
 class TriggerResponse(BaseModel):
     incident_id: str
     state: IncidentState
+    message: str
+    latitude: float
+    longitude: float
+    fix_age_seconds: int
+    pending_session_id: str | None
 
 
 class SessionPayload(BaseModel):
@@ -86,6 +91,12 @@ class EscalationView(BaseModel):
     sent: bool
     dry_run: bool
     error: str | None
+
+
+class AcknowledgeResponse(BaseModel):
+    state: IncidentState
+    outcome: SessionOutcome
+    escalation: EscalationView
 
 
 class IncidentView(BaseModel):
@@ -139,6 +150,8 @@ class IncidentManager:
         twilio: TwilioSMSClient | None,
         escalation_delay_seconds: float = 120.0,
         session_max_seconds: float = 90.0,
+        cap_repoll_count: int = 5,
+        cap_repoll_delay_seconds: float = 2.0,
         clock: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
@@ -149,6 +162,8 @@ class IncidentManager:
         self.twilio = twilio
         self.escalation_delay_seconds = escalation_delay_seconds
         self.session_max_seconds = session_max_seconds
+        self.cap_repoll_count = cap_repoll_count
+        self.cap_repoll_delay_seconds = cap_repoll_delay_seconds
         self.clock = clock
         self.sleep = sleep
         self._incidents: dict[str, _Incident] = {}
@@ -221,7 +236,7 @@ class IncidentManager:
             await self._set_outcome(incident, session, outcome)
         return outcome
 
-    async def acknowledge(self, incident_id: str) -> None:
+    async def acknowledge(self, incident_id: str) -> AcknowledgeResponse:
         incident = await self._get_incident(incident_id)
         async with self._lock:
             session = next(
@@ -239,6 +254,27 @@ class IncidentManager:
                 incident.state = IncidentState.RESOLVED
                 self._cancel_task(incident.escalation_task)
         logger.info("incident %s acknowledged", incident_id)
+        view = await self.view(incident_id)
+        return AcknowledgeResponse(
+            state=view.state,
+            outcome=SessionOutcome.ANSWERED,
+            escalation=view.escalation,
+        )
+
+    async def report_engagement(self, incident_id: str, session_id: str) -> None:
+        incident = await self._get_incident(incident_id)
+        async with self._lock:
+            session = incident.sessions.get(session_id)
+            if session is None or session.role != "runner":
+                raise SessionNotFoundError(session_id)
+            session.outcome = SessionOutcome.ANSWERED
+            if incident.state not in {
+                IncidentState.ESCALATED,
+                IncidentState.ESCALATION_FAILED,
+            }:
+                incident.state = IncidentState.RESOLVED
+                self._cancel_task(incident.escalation_task)
+        logger.info("incident %s runner session reported engagement", incident_id)
 
     async def view(self, incident_id: str) -> IncidentView:
         incident = await self._get_incident(incident_id)
@@ -319,13 +355,24 @@ class IncidentManager:
             if session is None or session.outcome == SessionOutcome.ANSWERED:
                 return
             conversation_id = session.conversation_id
-        outcome: SessionOutcome | None = (
-            await self._evaluate_session(conversation_id)
-            if conversation_id is not None
-            else SessionOutcome.UNANSWERED
-        )
-        if outcome is None:
-            outcome = SessionOutcome.UNANSWERED
+        if conversation_id is None:
+            outcome: SessionOutcome | None = SessionOutcome.UNANSWERED
+        else:
+            outcome = await self._evaluate_session(conversation_id)
+        if outcome is None and conversation_id is not None:
+            for _ in range(self.cap_repoll_count):
+                try:
+                    await self._wait(self.cap_repoll_delay_seconds)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    outcome = SessionOutcome.FAILED
+                    break
+                outcome = await self._evaluate_session(conversation_id)
+                if outcome is not None:
+                    break
+            if outcome is None:
+                outcome = SessionOutcome.UNANSWERED
         await self._set_outcome(incident, session, outcome)
 
     async def _escalation_timer(self, incident_id: str) -> None:

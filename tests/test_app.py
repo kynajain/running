@@ -90,6 +90,11 @@ async def test_trigger_and_current_contract() -> None:
     )
     assert response.status_code == 201
     created = response.json()
+    assert created["message"] == "I've fallen"
+    assert created["latitude"] == 51.5
+    assert created["longitude"] == -0.1
+    assert created["fix_age_seconds"] == 180
+    assert created["pending_session_id"]
     current = await browser.get("/api/incident/current?role=runner", headers=AUTH)
     assert current.status_code == 200
     incident = current.json()["incident"]
@@ -157,10 +162,88 @@ async def test_acknowledge_marks_runner_answered() -> None:
         f"/api/incident/{created['incident_id']}/acknowledge",
         headers=AUTH,
     )
-    assert acknowledged.json() == {"state": "resolved", "outcome": "answered"}
+    assert acknowledged.json() == {
+        "state": "resolved",
+        "outcome": "answered",
+        "escalation": {"sent": False, "dry_run": False, "error": None},
+    }
     detail = await browser.get(f"/api/incident/{created['incident_id']}", headers=AUTH)
     assert detail.json()["state"] == "resolved"
     assert detail.json()["sessions"][0]["outcome"] == "answered"
+    await close_clients(browser, elevenlabs, sms, app)
+
+
+async def test_acknowledge_after_escalation_reports_terminal_state() -> None:
+    browser, elevenlabs, sms, app = await make_app(
+        lambda _: httpx.Response(200, json={"token": "unused"}),
+        twilio_account_sid=None,
+        twilio_auth_token=None,
+        twilio_from_number=None,
+        contact_phone_number=None,
+    )
+    created = (
+        await browser.post(
+            "/api/trigger",
+            headers=AUTH,
+            json={"message": "Help", "latitude": 1, "longitude": 2, "fix_age_seconds": 3},
+        )
+    ).json()
+    manager = app.state.incidents
+    manager._cancel_task(manager._incidents[created["incident_id"]].escalation_task)
+    manager.sleep = no_sleep
+    manager.escalation_delay_seconds = 0
+    await manager._escalation_timer(created["incident_id"])
+    acknowledged = await browser.post(
+        f"/api/incident/{created['incident_id']}/acknowledge",
+        headers=AUTH,
+    )
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["state"] == "escalated"
+    assert acknowledged.json()["escalation"]["dry_run"] is True
+    await close_clients(browser, elevenlabs, sms, app)
+
+
+async def test_engagement_endpoint_marks_session_answered_and_is_idempotent() -> None:
+    browser, elevenlabs, sms, app = await make_app(
+        lambda _: httpx.Response(200, json={"status": "in-progress", "transcript": []}),
+    )
+    created = (
+        await browser.post(
+            "/api/trigger",
+            headers=AUTH,
+            json={"message": "Help", "latitude": 1, "longitude": 2, "fix_age_seconds": 3},
+        )
+    ).json()
+    session_id = created["pending_session_id"]
+    session = await browser.post(
+        f"/api/incident/{created['incident_id']}/session",
+        headers=AUTH,
+        json={"session_id": session_id, "conversation_id": "conversation-1"},
+    )
+    assert session.json() == {"outcome": None}
+    engagement_url = f"/api/incident/{created['incident_id']}/session/{session_id}/engagement"
+    first = await browser.post(engagement_url, headers=AUTH)
+    second = await browser.post(engagement_url, headers=AUTH)
+    assert first.json()["state"] == "resolved"
+    assert first.json()["outcome"] == "answered"
+    assert second.json() == first.json()
+    assert (await browser.get(f"/api/incident/{created['incident_id']}", headers=AUTH)).json()[
+        "sessions"
+    ][0]["outcome"] == "answered"
+    await close_clients(browser, elevenlabs, sms, app)
+
+
+async def test_engagement_endpoint_requires_auth_and_unknown_ids_404() -> None:
+    browser, elevenlabs, sms, app = await make_app(
+        lambda _: httpx.Response(200, json={"token": "unused"}),
+    )
+    unauthorized = await browser.post("/api/incident/unknown/session/unknown/engagement")
+    assert unauthorized.status_code == 401
+    missing = await browser.post(
+        "/api/incident/unknown/session/unknown/engagement",
+        headers=AUTH,
+    )
+    assert missing.status_code == 404
     await close_clients(browser, elevenlabs, sms, app)
 
 
@@ -296,6 +379,11 @@ def test_app_config_rejects_partial_sms(monkeypatch: pytest.MonkeyPatch) -> None
         AppConfig.from_env()
 
 
+def test_app_config_direct_construction_rejects_partial_sms() -> None:
+    with pytest.raises(ValueError, match="SMS configuration"):
+        app_config(twilio_auth_token=None)
+
+
 def test_app_config_repr_redacts_key() -> None:
     config = app_config()
     assert "test-api-key" not in str(config)
@@ -333,6 +421,118 @@ async def test_incident_manager_silent_session_fails_at_cap() -> None:
     )
     await manager._session_cap(incident.incident_id, session_id)
     assert (await manager.view(incident.incident_id)).sessions[0].outcome.value == "unanswered"
+    await manager.close()
+    await elevenlabs_client.aclose()
+    await sms_client.aclose()
+
+
+async def test_session_cap_repoll_finds_user_turn_after_live_session() -> None:
+    responses = iter(
+        [
+            {"status": "in-progress", "transcript": []},
+            {
+                "status": "done",
+                "transcript": [{"role": "user", "message": "Help", "time_in_call_secs": 4}],
+            },
+        ]
+    )
+
+    async def cap_sleep(seconds: float) -> None:
+        if seconds >= 100:
+            await asyncio.Event().wait()
+
+    elevenlabs_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json=next(responses)),
+        ),
+        base_url="https://api.elevenlabs.io",
+    )
+    manager = IncidentManager(
+        "runner",
+        None,
+        None,
+        ElevenLabsClient("key", client=elevenlabs_client),
+        None,
+        session_max_seconds=0,
+        cap_repoll_count=5,
+        cap_repoll_delay_seconds=0,
+        sleep=cap_sleep,
+    )
+    incident = await manager.create(
+        TriggerPayload(message="Help", latitude=1, longitude=2, fix_age_seconds=3)
+    )
+    session_id = incident.pending_session_id
+    assert session_id is not None
+    await manager.attach_session(
+        incident.incident_id,
+        SessionPayload(session_id=session_id, conversation_id="conversation-1"),
+    )
+    assert incident.sessions[session_id].cap_task is not None
+    await incident.sessions[session_id].cap_task
+    view = await manager.view(incident.incident_id)
+    assert view.sessions[0].outcome.value == "answered"
+    assert view.state.value == "resolved"
+    await manager.close()
+    await elevenlabs_client.aclose()
+
+
+async def test_session_cap_exhausts_live_repoll_budget_and_escalates() -> None:
+    requests = 0
+
+    def eleven_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json={"status": "in-progress", "transcript": []})
+
+    async def cap_sleep(seconds: float) -> None:
+        if seconds >= 100:
+            await asyncio.Event().wait()
+
+    elevenlabs_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(eleven_handler),
+        base_url="https://api.elevenlabs.io",
+    )
+    sms_calls = 0
+
+    def sms_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sms_calls
+        sms_calls += 1
+        return httpx.Response(201, json={})
+
+    sms_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(sms_handler),
+        base_url="https://api.twilio.com",
+    )
+    manager = IncidentManager(
+        "runner",
+        "+442222222222",
+        "+441234567890",
+        ElevenLabsClient("key", client=elevenlabs_client),
+        TwilioSMSClient("sid", "token", client=sms_client),
+        session_max_seconds=0,
+        cap_repoll_count=5,
+        cap_repoll_delay_seconds=0,
+        sleep=cap_sleep,
+    )
+    incident = await manager.create(
+        TriggerPayload(message="Help", latitude=1, longitude=2, fix_age_seconds=3)
+    )
+    manager._cancel_task(incident.escalation_task)
+    session_id = incident.pending_session_id
+    assert session_id is not None
+    await manager.attach_session(
+        incident.incident_id,
+        SessionPayload(session_id=session_id, conversation_id="conversation-1"),
+    )
+    assert incident.sessions[session_id].cap_task is not None
+    await incident.sessions[session_id].cap_task
+    manager.escalation_delay_seconds = 0
+    await manager._escalation_timer(incident.incident_id)
+    view = await manager.view(incident.incident_id)
+    assert view.sessions[0].outcome.value == "unanswered"
+    assert view.state.value == "escalated"
+    assert requests == 7
+    assert sms_calls == 1
     await manager.close()
     await elevenlabs_client.aclose()
     await sms_client.aclose()

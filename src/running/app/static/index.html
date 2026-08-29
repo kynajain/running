@@ -168,6 +168,7 @@
 
       let conversation = null;
       let incident = null;
+      let reportEngagement = async () => {};
 
       function setStatus(text, state = "") {
         els.status.textContent = text;
@@ -221,8 +222,7 @@
             message: "Your watch flagged a possible fall during your run.",
             ...LOCATION,
           });
-          incident = (await json(`/api/incident/current?role=runner`)).incident;
-          if (!incident) throw new Error(`incident ${triggered.incident_id} has no runner session`);
+          incident = triggered;
         } catch (error) {
           setStatus("Could not raise the incident.", "alert");
           log(`Trigger failed: ${error.message}`);
@@ -231,6 +231,22 @@
         }
 
         els.acknowledge.disabled = false;
+        const runnerSessionId = incident.pending_session_id;
+        let engagementReported = false;
+        let sessionRegistered = false;
+        let pendingEngagement = false;
+        reportEngagement = async () => {
+          if (engagementReported) return;
+          engagementReported = true;
+          if (!sessionRegistered) {
+            pendingEngagement = true;
+            return;
+          }
+          await json(
+            `/api/incident/${incident.incident_id}/session/${runnerSessionId}/engagement`,
+            {},
+          ).catch((error) => log(`Could not report engagement: ${error.message}`));
+        };
 
         const voice = await micAvailable();
         let session;
@@ -271,6 +287,7 @@
               els.compose.classList.remove("on");
               els.trigger.disabled = false;
               conversation = null;
+              reportEngagement = async () => {};
               if (incident) {
                 json(`/api/incident/${incident.incident_id}`)
                   .then((state) => log(`Incident ${state.state} — runner session ${state.sessions[0]?.outcome ?? "pending"}.`))
@@ -279,6 +296,7 @@
             },
             onMessage: ({ message, source }) => {
               log(message, source === "ai" ? "agent" : "user");
+              if (source === "user" && message?.trim()) reportEngagement();
             },
             onModeChange: ({ mode }) => {
               els.orb.classList.toggle("speaking", mode === "speaking");
@@ -303,8 +321,11 @@
           return;
         }
         await json(`/api/incident/${incident.incident_id}/session`, {
-          session_id: incident.pending_session_id,
+          session_id: runnerSessionId,
           conversation_id: conversationId,
+        }).then(() => {
+          sessionRegistered = true;
+          if (pendingEngagement) reportEngagement();
         }).catch((error) => log(`Could not register the session: ${error.message}`));
       }
 
@@ -313,6 +334,7 @@
         if (!text || !conversation) return;
         conversation.sendUserMessage(text);
         log(text, "user");
+        reportEngagement();
         els.reply.value = "";
       }
 
@@ -325,9 +347,18 @@
         if (!incident) return;
         els.acknowledge.disabled = true;
         try {
-          await json(`/api/incident/${incident.incident_id}/acknowledge`, {});
-          setStatus("Acknowledged. Escalation stopped.", "");
-          log("Runner acknowledged she is okay. Emergency contact will not be texted.");
+          const result = await json(`/api/incident/${incident.incident_id}/acknowledge`, {});
+          if (result.state === "resolved") {
+            setStatus("Acknowledged. Escalation stopped.", "");
+            log("Runner acknowledged she is okay. Emergency contact will not be texted.");
+          } else {
+            setStatus("Acknowledged after escalation.", "alert");
+            log(
+              result.escalation.dry_run
+                ? "Acknowledged after the contact SMS dry run was logged."
+                : "Acknowledged after the emergency contact was texted.",
+            );
+          }
         } catch (error) {
           els.acknowledge.disabled = false;
           log(`Acknowledge failed: ${error.message}`);

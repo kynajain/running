@@ -98,6 +98,13 @@ temporary credentials to the app. The API routes require the configured
 Twilio after the escalation delay if the runner has not explicitly
 acknowledged or produced a non-empty user transcript turn.
 
+Engagement has three signals: the runner can explicitly acknowledge, the
+trusted app can report a non-empty user utterance while the session is live,
+or the provider transcript can confirm a non-empty `user` turn after the
+session. The app-reported signal is trusted-app input; the provider transcript
+is the authoritative post-hoc check. If evaluation remains inconclusive after
+bounded re-polling, the fail-safe behavior is to escalate.
+
 The Twilio SMS leg is optional for demos. If it is not configured, escalation
 finishes as a dry run, logs the exact SMS body it would have sent, and exposes
 `dry_run: true` in the incident view. Partial SMS configuration is rejected at

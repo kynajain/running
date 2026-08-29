@@ -19,13 +19,20 @@ import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 
 from running.app.incident import (
+    AcknowledgeResponse,
     CurrentIncidentResponse,
     IncidentManager,
     IncidentNotFoundError,
-    IncidentState,
     IncidentSummary,
     IncidentView,
     SessionNotFoundError,
@@ -107,6 +114,18 @@ class AppConfig(BaseModel):
         if value is not None and not _E164.fullmatch(value):
             raise ValueError("phone number must use E.164 format")
         return value
+
+    @model_validator(mode="after")
+    def validate_sms_configuration(self) -> AppConfig:
+        sms_configured = (
+            self.twilio_account_sid is not None,
+            self.twilio_auth_token is not None,
+            self.twilio_from_number is not None,
+            self.contact_phone_number is not None,
+        )
+        if any(sms_configured) and not all(sms_configured):
+            raise ValueError("SMS configuration must provide all four values")
+        return self
 
     def __str__(self) -> str:
         return "AppConfig(<credentials redacted>)"
@@ -221,7 +240,15 @@ def create_app(
         _: None = Depends(require_auth),
     ) -> TriggerResponse:
         incident = await incidents.create(payload)
-        return TriggerResponse(incident_id=incident.incident_id, state=incident.state)
+        return TriggerResponse(
+            incident_id=incident.incident_id,
+            state=incident.state,
+            message=incident.message,
+            latitude=incident.latitude,
+            longitude=incident.longitude,
+            fix_age_seconds=incident.fix_age_seconds,
+            pending_session_id=incident.pending_session_id,
+        )
 
     @app.get("/api/incident/current", response_model=CurrentIncidentResponse)
     async def current(
@@ -263,12 +290,23 @@ def create_app(
     async def acknowledge(
         incident_id: str,
         _: None = Depends(require_auth),
-    ) -> dict[str, str]:
+    ) -> AcknowledgeResponse:
         try:
-            await incidents.acknowledge(incident_id)
+            return await incidents.acknowledge(incident_id)
         except (IncidentNotFoundError, SessionNotFoundError) as exc:
             raise HTTPException(status_code=404, detail="Incident not found") from exc
-        return {"state": IncidentState.RESOLVED, "outcome": "answered"}
+
+    @app.post("/api/incident/{incident_id}/session/{session_id}/engagement")
+    async def engagement(
+        incident_id: str,
+        session_id: str,
+        _: None = Depends(require_auth),
+    ) -> AcknowledgeResponse:
+        try:
+            await incidents.report_engagement(incident_id, session_id)
+            return await incidents.acknowledge(incident_id)
+        except (IncidentNotFoundError, SessionNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail="Incident or session not found") from exc
 
     @app.get("/api/incident/{incident_id}", response_model=IncidentView)
     async def incident(
