@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -83,6 +84,7 @@ class SessionView(BaseModel):
 
 class EscalationView(BaseModel):
     sent: bool
+    dry_run: bool
     error: str | None
 
 
@@ -113,6 +115,7 @@ class _Incident:
     state: IncidentState = IncidentState.TRIGGERED
     sessions: dict[str, _Session] = field(default_factory=dict)
     escalation_sent: bool = False
+    escalation_dry_run: bool = False
     escalation_attempted: bool = False
     escalation_error: str | None = None
     escalation_task: asyncio.Task[None] | None = None
@@ -130,10 +133,10 @@ class IncidentManager:
     def __init__(
         self,
         runner_agent_id: str,
-        contact_phone_number: str,
-        twilio_from_number: str,
+        contact_phone_number: str | None,
+        twilio_from_number: str | None,
         elevenlabs: ElevenLabsClient,
-        twilio: TwilioSMSClient,
+        twilio: TwilioSMSClient | None,
         escalation_delay_seconds: float = 120.0,
         session_max_seconds: float = 90.0,
         clock: Clock = time.monotonic,
@@ -182,7 +185,11 @@ class IncidentManager:
             ]
             if not active:
                 return None
-            return active[-1]
+            incident = active[-1]
+            if role == "contact":
+                incident = copy.copy(incident)
+                incident.pending_session_id = None
+            return incident
 
     async def attach_session(
         self,
@@ -323,16 +330,13 @@ class IncidentManager:
 
     async def _escalation_timer(self, incident_id: str) -> None:
         incident = await self._get_incident(incident_id)
+        wait_error: str | None = None
         try:
             await self._wait(self.escalation_delay_seconds)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            async with self._lock:
-                incident.escalation_attempted = True
-                incident.state = IncidentState.ESCALATION_FAILED
-                incident.escalation_error = str(exc)
-            return
+            wait_error = str(exc)
         async with self._lock:
             if incident.escalation_attempted or incident.state == IncidentState.RESOLVED:
                 return
@@ -347,21 +351,34 @@ class IncidentManager:
             incident.escalation_attempted = True
             incident.state = IncidentState.ESCALATING
         logger.info("incident %s escalating to emergency contact", incident_id)
+        body = self._sms_body(incident)
+        if (
+            self.twilio is None
+            or self.contact_phone_number is None
+            or self.twilio_from_number is None
+        ):
+            logger.info("incident %s SMS dry run: %s", incident_id, body)
+            async with self._lock:
+                incident.state = IncidentState.ESCALATED
+                incident.escalation_dry_run = True
+                incident.escalation_error = wait_error
+            return
         try:
             await self.twilio.send_sms(
                 self.contact_phone_number,
                 self.twilio_from_number,
-                self._sms_body(incident),
+                body,
             )
         except Exception as exc:
             async with self._lock:
                 incident.state = IncidentState.ESCALATION_FAILED
-                incident.escalation_error = str(exc)
+                incident.escalation_error = self._join_errors(wait_error, str(exc))
             logger.info("incident %s escalation SMS failed", incident_id)
         else:
             async with self._lock:
                 incident.state = IncidentState.ESCALATED
                 incident.escalation_sent = True
+                incident.escalation_error = wait_error
             logger.info("incident %s escalation SMS sent", incident_id)
 
     def _sms_body(self, incident: _Incident) -> str:
@@ -388,6 +405,7 @@ class IncidentManager:
             ],
             escalation=EscalationView(
                 sent=incident.escalation_sent,
+                dry_run=incident.escalation_dry_run,
                 error=incident.escalation_error,
             ),
         )
@@ -400,3 +418,7 @@ class IncidentManager:
     async def _wait(self, seconds: float) -> None:
         deadline = self.clock() + seconds
         await self.sleep(max(0.0, deadline - self.clock()))
+
+    @staticmethod
+    def _join_errors(first: str | None, second: str) -> str:
+        return f"{first}; {second}" if first else second

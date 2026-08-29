@@ -51,10 +51,10 @@ class AppConfig(BaseModel):
     elevenlabs_api_key: SecretStr
     app_token: SecretStr
     runner_agent_id: str
-    twilio_account_sid: SecretStr
-    twilio_auth_token: SecretStr
-    twilio_from_number: str
-    contact_phone_number: str
+    twilio_account_sid: SecretStr | None = None
+    twilio_auth_token: SecretStr | None = None
+    twilio_from_number: str | None = None
+    contact_phone_number: str | None = None
     escalation_delay_seconds: float = Field(default=120.0, gt=0)
     session_max_seconds: float = Field(default=90.0, gt=0)
 
@@ -64,32 +64,47 @@ class AppConfig(BaseModel):
             "ELEVENLABS_API_KEY": "elevenlabs_api_key",
             "ELEVENLABS_AGENT_ID": "runner_agent_id",
             "APP_TOKEN": "app_token",
-            "TWILIO_ACCOUNT_SID": "twilio_account_sid",
-            "TWILIO_AUTH_TOKEN": "twilio_auth_token",
-            "TWILIO_FROM_NUMBER": "twilio_from_number",
-            "CONTACT_PHONE_NUMBER": "contact_phone_number",
         }
         missing = [env_name for env_name in names if not os.environ.get(env_name)]
         if missing:
             raise AppConfigurationError(
                 "Missing required environment variable(s): " + ", ".join(missing)
             )
+        sms_names = (
+            "TWILIO_ACCOUNT_SID",
+            "TWILIO_AUTH_TOKEN",
+            "TWILIO_FROM_NUMBER",
+            "CONTACT_PHONE_NUMBER",
+        )
+        sms_present = [bool(os.environ.get(name)) for name in sms_names]
+        if any(sms_present) and not all(sms_present):
+            raise AppConfigurationError(
+                "SMS configuration must provide all of: " + ", ".join(sms_names)
+            )
         return cls(
             elevenlabs_api_key=SecretStr(os.environ["ELEVENLABS_API_KEY"]),
             runner_agent_id=os.environ["ELEVENLABS_AGENT_ID"],
             app_token=SecretStr(os.environ["APP_TOKEN"]),
-            twilio_account_sid=SecretStr(os.environ["TWILIO_ACCOUNT_SID"]),
-            twilio_auth_token=SecretStr(os.environ["TWILIO_AUTH_TOKEN"]),
-            twilio_from_number=os.environ["TWILIO_FROM_NUMBER"],
-            contact_phone_number=os.environ["CONTACT_PHONE_NUMBER"],
+            twilio_account_sid=(
+                SecretStr(os.environ["TWILIO_ACCOUNT_SID"])
+                if os.environ.get("TWILIO_ACCOUNT_SID")
+                else None
+            ),
+            twilio_auth_token=(
+                SecretStr(os.environ["TWILIO_AUTH_TOKEN"])
+                if os.environ.get("TWILIO_AUTH_TOKEN")
+                else None
+            ),
+            twilio_from_number=os.environ.get("TWILIO_FROM_NUMBER"),
+            contact_phone_number=os.environ.get("CONTACT_PHONE_NUMBER"),
             escalation_delay_seconds=float(os.environ.get("ESCALATION_DELAY_SECONDS", "120")),
             session_max_seconds=float(os.environ.get("SESSION_MAX_SECONDS", "90")),
         )
 
     @field_validator("twilio_from_number", "contact_phone_number")
     @classmethod
-    def validate_phone_number(cls, value: str) -> str:
-        if not _E164.fullmatch(value):
+    def validate_phone_number(cls, value: str | None) -> str | None:
+        if value is not None and not _E164.fullmatch(value):
             raise ValueError("phone number must use E.164 format")
         return value
 
@@ -128,11 +143,18 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title="Runner safety in-app calls")
     elevenlabs = ElevenLabsClient(config.elevenlabs_api_key.get_secret_value(), client=client)
-    twilio = TwilioSMSClient(
-        config.twilio_account_sid.get_secret_value(),
-        config.twilio_auth_token.get_secret_value(),
-        client=sms_client,
-    )
+    twilio: TwilioSMSClient | None = None
+    if (
+        config.twilio_account_sid is not None
+        and config.twilio_auth_token is not None
+        and config.twilio_from_number is not None
+        and config.contact_phone_number is not None
+    ):
+        twilio = TwilioSMSClient(
+            config.twilio_account_sid.get_secret_value(),
+            config.twilio_auth_token.get_secret_value(),
+            client=sms_client,
+        )
     incidents = IncidentManager(
         runner_agent_id=config.runner_agent_id,
         contact_phone_number=config.contact_phone_number,
@@ -148,7 +170,9 @@ def create_app(
 
     def require_auth(authorization: str | None = Header(default=None)) -> None:
         expected = f"Bearer {config.app_token.get_secret_value()}"
-        if authorization is None or not hmac.compare_digest(authorization, expected):
+        if authorization is None or not hmac.compare_digest(
+            authorization.encode("utf-8"), expected.encode("utf-8")
+        ):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     @app.get("/api/conversation-token", response_model=ConversationTokenPayload)
@@ -264,7 +288,8 @@ def create_app(
     async def shutdown() -> None:
         await incidents.close()
         await elevenlabs.aclose()
-        await twilio.aclose()
+        if twilio is not None:
+            await twilio.aclose()
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

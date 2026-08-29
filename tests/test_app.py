@@ -128,6 +128,20 @@ async def test_panic_alias_and_authentication() -> None:
     await close_clients(browser, elevenlabs, sms, app)
 
 
+async def test_non_ascii_authorization_header_returns_401() -> None:
+    browser, elevenlabs, sms, app = await make_app(
+        lambda _: httpx.Response(200, json={"token": "unused"}),
+    )
+    request = httpx.Request(
+        "GET",
+        "http://testserver/api/incident/current",
+        headers=[(b"authorization", b"Bearer caf\xe9")],
+    )
+    response = await browser.send(request)
+    assert response.status_code == 401
+    await close_clients(browser, elevenlabs, sms, app)
+
+
 async def test_acknowledge_marks_runner_answered() -> None:
     browser, elevenlabs, sms, app = await make_app(
         lambda _: httpx.Response(200, json={"token": "unused"}),
@@ -218,6 +232,21 @@ async def test_signed_url_and_provider_errors_are_safely_mapped() -> None:
     await close_clients(browser, elevenlabs, sms, app)
 
 
+async def test_contact_current_view_hides_pending_session() -> None:
+    browser, elevenlabs, sms, app = await make_app(
+        lambda _: httpx.Response(200, json={"token": "unused"}),
+    )
+    await browser.post(
+        "/api/trigger",
+        headers=AUTH,
+        json={"message": "Help", "latitude": 1, "longitude": 2, "fix_age_seconds": 3},
+    )
+    current = await browser.get("/api/incident/current?role=contact", headers=AUTH)
+    assert current.status_code == 200
+    assert current.json()["incident"]["pending_session_id"] is None
+    await close_clients(browser, elevenlabs, sms, app)
+
+
 def test_app_config_missing_env_names(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("ELEVENLABS_API_KEY", "ELEVENLABS_AGENT_ID", "APP_TOKEN"):
         monkeypatch.delenv(name, raising=False)
@@ -227,6 +256,44 @@ def test_app_config_missing_env_names(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "ELEVENLABS_API_KEY" in message
     assert "ELEVENLABS_AGENT_ID" in message
     assert "APP_TOKEN" in message
+
+
+def test_app_config_allows_unconfigured_sms(monkeypatch: pytest.MonkeyPatch) -> None:
+    values = {
+        "ELEVENLABS_API_KEY": "key",
+        "ELEVENLABS_AGENT_ID": "agent",
+        "APP_TOKEN": "token",
+    }
+    for name in (
+        "ELEVENLABS_API_KEY",
+        "ELEVENLABS_AGENT_ID",
+        "APP_TOKEN",
+        "TWILIO_ACCOUNT_SID",
+        "TWILIO_AUTH_TOKEN",
+        "TWILIO_FROM_NUMBER",
+        "CONTACT_PHONE_NUMBER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    config = AppConfig.from_env()
+    assert config.twilio_account_sid is None
+    assert config.contact_phone_number is None
+
+
+def test_app_config_rejects_partial_sms(monkeypatch: pytest.MonkeyPatch) -> None:
+    values = {
+        "ELEVENLABS_API_KEY": "key",
+        "ELEVENLABS_AGENT_ID": "agent",
+        "APP_TOKEN": "token",
+        "TWILIO_ACCOUNT_SID": "sid",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    for name in ("TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "CONTACT_PHONE_NUMBER"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(AppConfigurationError, match="SMS configuration"):
+        AppConfig.from_env()
 
 
 def test_app_config_repr_redacts_key() -> None:
@@ -352,6 +419,76 @@ async def test_escalation_sms_is_sent_once() -> None:
     await manager.close()
     await elevenlabs_client.aclose()
     await sms_client.aclose()
+
+
+async def test_timer_error_still_attempts_sms() -> None:
+    sms_calls = 0
+
+    def sms_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal sms_calls
+        sms_calls += 1
+        return httpx.Response(201, json={"sid": "SM1"})
+
+    async def broken_sleep(seconds: float) -> None:
+        raise RuntimeError("timer broke")
+
+    elevenlabs_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={})),
+        base_url="https://api.elevenlabs.io",
+    )
+    sms_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(sms_handler),
+        base_url="https://api.twilio.com",
+    )
+    manager = IncidentManager(
+        "runner",
+        "+442222222222",
+        "+441234567890",
+        ElevenLabsClient("key", client=elevenlabs_client),
+        TwilioSMSClient("sid", "token", client=sms_client),
+        sleep=broken_sleep,
+    )
+    incident = await manager.create(
+        TriggerPayload(message="Help", latitude=51.5, longitude=-0.1, fix_age_seconds=180)
+    )
+    await manager._escalation_timer(incident.incident_id)
+    view = await manager.view(incident.incident_id)
+    assert view.state.value == "escalated"
+    assert view.escalation.sent is True
+    assert "timer broke" in (view.escalation.error or "")
+    assert sms_calls == 1
+    await manager.close()
+    await elevenlabs_client.aclose()
+    await sms_client.aclose()
+
+
+async def test_unconfigured_sms_escalates_as_dry_run(caplog: pytest.LogCaptureFixture) -> None:
+    elevenlabs_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={})),
+        base_url="https://api.elevenlabs.io",
+    )
+    manager = IncidentManager(
+        "runner",
+        None,
+        None,
+        ElevenLabsClient("key", client=elevenlabs_client),
+        None,
+        escalation_delay_seconds=0,
+        sleep=no_sleep,
+    )
+    incident = await manager.create(
+        TriggerPayload(message="Need help", latitude=51.5, longitude=-0.1, fix_age_seconds=180)
+    )
+    with caplog.at_level("INFO"):
+        await manager._escalation_timer(incident.incident_id)
+    view = await manager.view(incident.incident_id)
+    assert view.state.value == "escalated"
+    assert view.escalation.sent is False
+    assert view.escalation.dry_run is True
+    assert "Need help" in caplog.text
+    assert "https://maps.google.com/?q=51.5,-0.1" in caplog.text
+    await manager.close()
+    await elevenlabs_client.aclose()
 
 
 async def test_session_cap_does_not_downgrade_answered_session() -> None:

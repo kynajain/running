@@ -73,10 +73,8 @@ Set these environment variables:
 * `ELEVENLABS_API_KEY`
 * `ELEVENLABS_AGENT_ID`
 * `APP_TOKEN`
-* `TWILIO_ACCOUNT_SID`
-* `TWILIO_AUTH_TOKEN`
-* `TWILIO_FROM_NUMBER`
-* `CONTACT_PHONE_NUMBER`
+* `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, and
+  `CONTACT_PHONE_NUMBER` (optional SMS leg; provide all four together)
 * `ESCALATION_DELAY_SECONDS` (optional, default `120`)
 * `SESSION_MAX_SECONDS` (optional, default `90`)
 * `HOST` (optional, default `127.0.0.1`)
@@ -90,10 +88,8 @@ running-app
 python -m running.app.server
 ```
 
-The server listens on `127.0.0.1` unless `HOST` says otherwise: the
-credential-minting endpoints have no authentication, so anyone who can reach
-them can start a conversation on the account. Add authentication before binding
-it to a public interface.
+The server listens on `127.0.0.1` unless `HOST` says otherwise. All API routes
+require the configured bearer `APP_TOKEN`, while `/healthz` is public.
 
 The ElevenLabs API key never reaches the browser. The server uses it to mint
 short-lived conversation tokens or signed URLs, then returns only those
@@ -101,6 +97,11 @@ temporary credentials to the app. The API routes require the configured
 `APP_TOKEN`; `/healthz` is public. The emergency-contact SMS is sent through
 Twilio after the escalation delay if the runner has not explicitly
 acknowledged or produced a non-empty user transcript turn.
+
+The Twilio SMS leg is optional for demos. If it is not configured, escalation
+finishes as a dry run, logs the exact SMS body it would have sent, and exposes
+`dry_run: true` in the incident view. Partial SMS configuration is rejected at
+startup.
 
 The in-memory incident state machine, credential minting, and mocked HTTP
 tests have been exercised locally. The in-app runner conversation was also
