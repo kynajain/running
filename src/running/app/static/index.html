@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Runner safety — in-app call</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b0f14;
+        --panel: #141b23;
+        --line: #243040;
+        --text: #e8eef5;
+        --muted: #8fa3b8;
+        --accent: #4ade80;
+        --alert: #f87171;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: var(--bg);
+        color: var(--text);
+        font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      }
+      .phone {
+        width: 390px;
+        min-height: 720px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 32px;
+        padding: 28px 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+      h1 { font-size: 19px; margin: 0; }
+      .sub { color: var(--muted); font-size: 14px; margin: 0; }
+      .status {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 14px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        font-size: 14px;
+      }
+      .dot {
+        width: 10px; height: 10px; border-radius: 50%;
+        background: var(--muted); flex: none;
+      }
+      .dot.live { background: var(--accent); animation: pulse 1.4s infinite; }
+      .dot.alert { background: var(--alert); }
+      @keyframes pulse { 50% { opacity: 0.25; } }
+      .agent {
+        display: grid;
+        place-items: center;
+        gap: 14px;
+        padding: 28px 0;
+      }
+      .orb {
+        width: 132px; height: 132px; border-radius: 50%;
+        background: radial-gradient(circle at 35% 30%, #2b6cb0, #15324d 70%);
+        box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.4);
+        transition: transform 0.15s ease;
+      }
+      .orb.speaking { animation: ring 1.1s infinite; }
+      @keyframes ring {
+        0% { box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.35); }
+        100% { box-shadow: 0 0 0 26px rgba(74, 222, 128, 0); }
+      }
+      .who { font-weight: 600; }
+      button {
+        font: inherit;
+        font-weight: 600;
+        padding: 14px 18px;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        background: #1d2733;
+        color: var(--text);
+        cursor: pointer;
+      }
+      button.primary { background: var(--alert); border-color: transparent; color: #180a0a; }
+      button.hangup { background: #2a1a1a; border-color: #52302f; }
+      button:disabled { opacity: 0.45; cursor: not-allowed; }
+      .row { display: grid; gap: 10px; }
+      .log {
+        flex: 1;
+        overflow-y: auto;
+        border-top: 1px solid var(--line);
+        padding-top: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        font-size: 14px;
+      }
+      .msg { padding: 9px 12px; border-radius: 12px; max-width: 85%; }
+      .msg.agent { background: #1b2733; align-self: flex-start; }
+      .msg.user { background: #223142; align-self: flex-end; }
+      .msg.system { color: var(--muted); font-size: 13px; align-self: center; text-align: center; }
+      .loc { color: var(--muted); font-size: 13px; }
+      .compose { display: none; gap: 8px; }
+      .compose.on { display: flex; }
+      .compose input {
+        flex: 1;
+        font: inherit;
+        padding: 12px 14px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: #101820;
+        color: var(--text);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="phone">
+      <div>
+        <h1>Runner safety</h1>
+        <p class="sub">London Olympic Stadium — run in progress</p>
+      </div>
+
+      <div class="status">
+        <span class="dot" id="dot"></span>
+        <span id="status">Idle. No incident detected.</span>
+      </div>
+
+      <div class="agent">
+        <div class="orb" id="orb"></div>
+        <div class="who" id="who">Safety assistant</div>
+        <div class="loc" id="loc">51.5387, -0.0166</div>
+      </div>
+
+      <div class="row">
+        <button id="mic">Turn on voice</button>
+        <button class="primary" id="trigger">Simulate incident</button>
+        <button id="acknowledge" disabled>I'm okay</button>
+        <button class="hangup" id="hangup" disabled>End call</button>
+        <div class="compose" id="compose">
+          <input id="reply" placeholder="Type a reply" autocomplete="off" />
+          <button id="send">Send</button>
+        </div>
+      </div>
+
+      <div class="log" id="log"></div>
+    </main>
+
+    <script type="module">
+      import { Conversation } from "https://esm.sh/@elevenlabs/client@0.9.0";
+
+      const els = {
+        dot: document.getElementById("dot"),
+        status: document.getElementById("status"),
+        orb: document.getElementById("orb"),
+        who: document.getElementById("who"),
+        trigger: document.getElementById("trigger"),
+        mic: document.getElementById("mic"),
+        acknowledge: document.getElementById("acknowledge"),
+        hangup: document.getElementById("hangup"),
+        log: document.getElementById("log"),
+        compose: document.getElementById("compose"),
+        reply: document.getElementById("reply"),
+        send: document.getElementById("send"),
+      };
+
+      const LOCATION = { latitude: 51.5387, longitude: -0.0166, fix_age_seconds: 42 };
+      const APP_TOKEN =
+        new URLSearchParams(location.search).get("token") ?? location.hash.slice(1);
+
+      let conversation = null;
+      let incident = null;
+      let reportEngagement = async () => {};
+
+      function setStatus(text, state = "") {
+        els.status.textContent = text;
+        els.dot.className = `dot ${state}`;
+      }
+
+      function log(text, kind = "system") {
+        const node = document.createElement("div");
+        node.className = `msg ${kind}`;
+        node.textContent = text;
+        els.log.appendChild(node);
+        els.log.scrollTop = els.log.scrollHeight;
+      }
+
+      async function json(path, body) {
+        const response = await fetch(path, {
+          method: body === undefined ? "GET" : "POST",
+          headers: {
+            Authorization: `Bearer ${APP_TOKEN}`,
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+        if (!response.ok) throw new Error(`${path} failed (${response.status})`);
+        return response.json();
+      }
+
+      const MIC_REASONS = {
+        NotAllowedError:
+          "the browser blocked it. Tap the padlock or aA in the address bar, set Microphone to Allow, then reload.",
+        NotFoundError: "this device has no microphone.",
+        NotReadableError: "another app is holding the microphone. Close it and try again.",
+        SecurityError: "this browser will not share a microphone here. Open the link in Safari or Chrome directly.",
+      };
+
+      async function micAvailable() {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          log(
+            "Voice off: this browser cannot use a microphone here. Open the link in Safari or Chrome, not inside another app.",
+          );
+          return false;
+        }
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream.getTracks().forEach((track) => track.stop());
+          return true;
+        } catch (error) {
+          log(`Voice off: ${MIC_REASONS[error.name] ?? `the microphone failed (${error.name}).`}`);
+          log("Using typing instead so the demo still works.");
+          return false;
+        }
+      }
+
+      function fixAge(seconds) {
+        if (seconds < 90) return `${seconds} seconds ago`;
+        return `${Math.round(seconds / 60)} minutes ago`;
+      }
+
+      async function startCall() {
+        els.trigger.disabled = true;
+        setStatus("Incident flagged. Connecting the safety assistant…", "alert");
+        log("Tracker flagged a possible incident. Starting an in-app call.");
+
+        const micRequest = micAvailable();
+
+        try {
+          const triggered = await json("/api/trigger", {
+            message: "Your watch flagged a possible fall during your run.",
+            ...LOCATION,
+          });
+          incident = triggered;
+        } catch (error) {
+          setStatus("Could not raise the incident.", "alert");
+          log(`Trigger failed: ${error.message}`);
+          els.trigger.disabled = false;
+          return;
+        }
+
+        els.acknowledge.disabled = false;
+        const incidentId = incident.incident_id;
+        const runnerSessionId = incident.pending_session_id;
+        let engagementReported = false;
+        let sessionRegistered = false;
+        let engagementPending = false;
+        let engagementInFlight = false;
+        let engagementRequest = null;
+        const ownReportEngagement = () => {
+          engagementPending = true;
+          if (engagementInFlight || engagementRequest) return engagementRequest;
+          if (!sessionRegistered || engagementReported) return null;
+          engagementInFlight = true;
+          engagementRequest = (async () => {
+            try {
+              await json(`/api/incident/${incidentId}/session/${runnerSessionId}/engagement`, {});
+              engagementPending = false;
+              engagementReported = true;
+            } catch (error) {
+              log(`Could not report engagement: ${error.message}`);
+            } finally {
+              engagementInFlight = false;
+              engagementRequest = null;
+            }
+          })();
+          return engagementRequest;
+        };
+        reportEngagement = ownReportEngagement;
+
+        const voice = await micRequest;
+        let session;
+        try {
+          session = voice
+            ? { conversationToken: (await json(`/api/conversation-token?leg=runner`)).token }
+            : {
+                signedUrl: (await json(`/api/signed-url?leg=runner`)).signed_url,
+                textOnly: true,
+                overrides: { conversation: { textOnly: true } },
+              };
+        } catch (error) {
+          setStatus("Could not reach the safety service.", "alert");
+          log(`Failed to get a conversation credential: ${error.message}`);
+          els.trigger.disabled = false;
+          return;
+        }
+
+        try {
+          conversation = await Conversation.startSession({
+            ...session,
+            dynamicVariables: {
+              incident_message: incident.message,
+              latitude: String(incident.latitude),
+              longitude: String(incident.longitude),
+              location_fix_age: fixAge(incident.fix_age_seconds),
+            },
+            onConnect: () => {
+              setStatus(voice ? "In-app call connected." : "In-app chat connected (no mic).", "live");
+              els.hangup.disabled = false;
+              els.compose.classList.toggle("on", !voice);
+              log(voice ? "Connected. The assistant will speak first." : "Connected in text mode.");
+            },
+            onDisconnect: () => {
+              setStatus("Call ended.", "");
+              els.orb.classList.remove("speaking");
+              els.hangup.disabled = true;
+              els.compose.classList.remove("on");
+              els.trigger.disabled = false;
+              conversation = null;
+              const finishDisconnect = async () => {
+                if (engagementRequest) await engagementRequest;
+                if (engagementPending && !engagementReported) await ownReportEngagement();
+                if (reportEngagement === ownReportEngagement) reportEngagement = async () => {};
+              };
+              finishDisconnect();
+              {
+                json(`/api/incident/${incidentId}`)
+                  .then((state) => log(`Incident ${state.state} — runner session ${state.sessions[0]?.outcome ?? "pending"}.`))
+                  .catch(() => {});
+              }
+            },
+            onMessage: ({ message, source }) => {
+              log(message, source === "ai" ? "agent" : "user");
+              if (source === "user" && message?.trim()) reportEngagement();
+            },
+            onModeChange: ({ mode }) => {
+              els.orb.classList.toggle("speaking", mode === "speaking");
+              els.who.textContent =
+                mode === "speaking" ? "Safety assistant — speaking" : "Safety assistant — listening";
+            },
+            onError: (error) => {
+              setStatus("Call error.", "alert");
+              log(`Call error: ${error?.message ?? error}`);
+            },
+          });
+        } catch (error) {
+          setStatus("Could not start the call.", "alert");
+          log(`startSession failed: ${error.message}`);
+          els.trigger.disabled = false;
+          return;
+        }
+
+        const conversationId = conversation.getId?.();
+        if (!conversationId) {
+          log("No conversation id — the backend cannot verify engagement for this session.");
+          return;
+        }
+        await json(`/api/incident/${incidentId}/session`, {
+          session_id: runnerSessionId,
+          conversation_id: conversationId,
+        }).then(() => {
+          sessionRegistered = true;
+          if (engagementPending && !engagementReported) ownReportEngagement();
+        }).catch((error) => log(`Could not register the session: ${error.message}`));
+      }
+
+      function sendReply() {
+        const text = els.reply.value.trim();
+        if (!text || !conversation) return;
+        conversation.sendUserMessage(text);
+        log(text, "user");
+        reportEngagement();
+        els.reply.value = "";
+      }
+
+      els.send.addEventListener("click", sendReply);
+      els.reply.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") sendReply();
+      });
+      els.trigger.addEventListener("click", startCall);
+      els.mic.addEventListener("click", async () => {
+        els.mic.disabled = true;
+        const ok = await micAvailable();
+        els.mic.disabled = false;
+        els.mic.textContent = ok ? "Voice ready" : "Turn on voice";
+        if (ok) log("Microphone allowed. The assistant will speak when you start the call.");
+      });
+      els.acknowledge.addEventListener("click", async () => {
+        if (!incident) return;
+        els.acknowledge.disabled = true;
+        try {
+          const result = await json(`/api/incident/${incident.incident_id}/acknowledge`, {});
+          if (result.state === "resolved") {
+            setStatus("Acknowledged. Escalation stopped.", "");
+            log("Runner acknowledged she is okay. Emergency contact will not be texted.");
+          } else {
+            setStatus("Acknowledged after escalation.", "alert");
+            log(
+              result.escalation.dry_run
+                ? "Acknowledged after the contact SMS dry run was logged."
+                : "Acknowledged after the emergency contact was texted.",
+            );
+          }
+        } catch (error) {
+          els.acknowledge.disabled = false;
+          log(`Acknowledge failed: ${error.message}`);
+        }
+      });
+      els.hangup.addEventListener("click", async () => {
+        els.hangup.disabled = true;
+        await conversation?.endSession();
+      });
+    </script>
+  </body>
+</html>
