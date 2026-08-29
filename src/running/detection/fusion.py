@@ -21,24 +21,26 @@ def fuse(
 
     Weights are renormalised over the signals that actually reported, so a
     missing sensor lowers precision rather than silently dragging the score
-    toward zero. Nothing fires on a single signal.
+    toward zero. Nothing fires on a single signal, and scores are deduplicated
+    by name first so one sensor counted twice cannot stand in for two.
     """
 
-    if not scores:
+    unique = list({score.name: score for score in scores}.values())
+    if not unique:
         return StressAssessment(
             confidence=0.0, contributions=[], triggered=False, reason="no signals"
         )
 
-    total_weight = sum(score.weight for score in scores)
-    confidence = sum(score.score * score.weight for score in scores) / total_weight
+    total_weight = sum(score.weight for score in unique)
+    confidence = sum(score.score * score.weight for score in unique) / total_weight
     confidence = min(max(confidence, 0.0), 1.0)
 
-    if len(scores) < min_signals:
+    if len(unique) < min_signals:
         return StressAssessment(
             confidence=confidence,
-            contributions=list(scores),
+            contributions=unique,
             triggered=False,
-            reason=f"only {len(scores)} of {min_signals} required signals available",
+            reason=f"only {len(unique)} of {min_signals} required signals available",
         )
 
     triggered = confidence >= threshold
@@ -49,7 +51,7 @@ def fuse(
     )
     return StressAssessment(
         confidence=confidence,
-        contributions=list(scores),
+        contributions=unique,
         triggered=triggered,
         reason=reason,
     )

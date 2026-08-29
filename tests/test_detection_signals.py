@@ -194,3 +194,35 @@ def test_assess_runs_registered_detectors() -> None:
         "respiratory_excess",
     }
     assert assessment.triggered
+
+
+def test_eda_counts_one_monotonic_rise_as_a_single_response() -> None:
+    detector = PhasicEDADetector()
+    climbing = [
+        sample(Metric.SKIN_CONDUCTANCE, 2.0 + index * 0.2, index * 0.1, "uS") for index in range(10)
+    ]
+
+    score = detector.score(
+        DetectionContext(now=START + timedelta(minutes=5), samples=climbing, activity=[])
+    )
+
+    assert score is not None
+    assert score.detail.startswith("1 phasic burst")
+
+
+def test_fusion_ignores_a_signal_counted_twice() -> None:
+    duplicate = SignalScore(name="heart_rate_excess", score=1.0, weight=0.4, detail="")
+
+    assessment = fuse([duplicate, duplicate])
+
+    assert not assessment.triggered
+    assert len(assessment.contributions) == 1
+
+
+def test_assess_rejects_a_duplicated_detector() -> None:
+    context = history(Metric.HEART_RATE, at_rest=60, per_intensity=60, latest=110)
+
+    assessment = assess(context, signals=[HEART_RATE_DETECTOR, HEART_RATE_DETECTOR])
+
+    assert not assessment.triggered
+    assert "required signals" in assessment.reason

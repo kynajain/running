@@ -223,6 +223,7 @@ class PhasicEDADetector:
         bursts = 0
         trough = window[0].value
         rising = False
+        counted = False
         for previous, current in zip(window, window[1:], strict=False):
             seconds = (current.start - previous.start).total_seconds()
             if seconds <= 0:
@@ -232,11 +233,14 @@ class PhasicEDADetector:
                 if not rising:
                     trough = previous.value
                     rising = True
-                if current.value - trough >= self.min_amplitude_us:
+                if not counted and current.value - trough >= self.min_amplitude_us:
                     bursts += 1
-                    rising = False
+                    counted = True
             elif rate < 0:
+                # A single monotonic rise is one response however far it goes;
+                # only a decline can open the next one.
                 rising = False
+                counted = False
 
         minutes = max((window[-1].start - window[0].start).total_seconds() / 60, 1e-6)
         per_minute = bursts / minutes

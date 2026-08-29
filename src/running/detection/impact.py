@@ -144,4 +144,4 @@ def _stillness(
         if abs(sample.magnitude - 1.0) > tolerance:
             return None
     covered = window[-1].timestamp - start
-    return covered if covered >= limit * 0.8 else None
+    return covered if covered >= limit else None

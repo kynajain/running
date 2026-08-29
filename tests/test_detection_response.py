@@ -177,3 +177,50 @@ def test_repeated_detections_do_not_restart_the_countdown() -> None:
 def test_countdown_must_stay_inside_the_ten_to_twenty_second_band() -> None:
     with pytest.raises(ValueError, match="between 10 and 20"):
         ResponseConfig(countdown=timedelta(seconds=45))
+
+
+def test_late_dismissal_cannot_suppress_the_no_response_alarm() -> None:
+    machine = ResponseMachine()
+    machine.handle(crossed(Trigger.IMPACT))
+
+    effects = machine.handle(Dismissed(at=at(16)))
+
+    assert machine.state is ResponseState.ALARM
+    assert effects[-1] == RaiseAlarm(
+        at=at(16),
+        reason=AlarmReason.NO_RESPONSE,
+        trigger=Trigger.IMPACT,
+        recording=False,
+    )
+
+
+def test_late_distress_confirmation_alarms_rather_than_prompting() -> None:
+    machine = ResponseMachine(ResponseConfig(recording_opt_in=True))
+    machine.handle(crossed())
+
+    effects = machine.handle(DistressConfirmed(at=at(20)))
+
+    assert machine.state is ResponseState.ALARM
+    assert effects[-1].reason is AlarmReason.NO_RESPONSE
+
+
+def test_recording_prompt_can_be_dismissed() -> None:
+    machine = ResponseMachine(ResponseConfig(recording_opt_in=True))
+    machine.handle(crossed())
+    machine.handle(DistressConfirmed(at=at(4)))
+
+    effects = machine.handle(Dismissed(at=at(8)))
+
+    assert machine.state is ResponseState.IDLE
+    assert effects == [DismissPrompt()]
+
+
+def test_late_dismissal_of_the_recording_prompt_still_alarms() -> None:
+    machine = ResponseMachine(ResponseConfig(recording_opt_in=True))
+    machine.handle(crossed())
+    machine.handle(DistressConfirmed(at=at(4)))
+
+    effects = machine.handle(Dismissed(at=at(20)))
+
+    assert machine.state is ResponseState.ALARM
+    assert effects[-1].reason is AlarmReason.USER_CONFIRMED

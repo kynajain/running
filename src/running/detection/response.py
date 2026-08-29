@@ -5,6 +5,10 @@
 The machine is pure: it takes an event, mutates its own state and returns the
 effects a caller must perform. No I/O, no clock and no threads, so every branch
 (including the "user is unconscious" one) is exercised in tests.
+
+Deadlines are enforced against the timestamp of whichever event arrives first,
+not against a ``Tick``: a countdown that has already run out escalates even if
+the delivery of the tick was delayed behind a late user response.
 """
 
 from __future__ import annotations
@@ -141,17 +145,19 @@ class ResponseMachine:
         match self.state, event:
             case ResponseState.IDLE, ThresholdCrossed():
                 return self._confirm(event)
-            case ResponseState.CONFIRMING, Tick() if self._expired(event.at):
+            case ResponseState.CONFIRMING, _ if self._expired(event.at):
                 return self._alarm(event.at, AlarmReason.NO_RESPONSE, prompted=True)
             case ResponseState.CONFIRMING, Dismissed():
                 return self._reset(event.at)
             case ResponseState.CONFIRMING, DistressConfirmed():
                 return self._consent(event.at)
+            case ResponseState.CONSENTING, _ if self._expired(event.at):
+                return self._alarm(event.at, AlarmReason.USER_CONFIRMED, prompted=True)
+            case ResponseState.CONSENTING, Dismissed():
+                return self._reset(event.at)
             case ResponseState.CONSENTING, RecordingChoice(accepted=True):
                 return self._record(event.at)
             case ResponseState.CONSENTING, RecordingChoice(accepted=False):
-                return self._alarm(event.at, AlarmReason.USER_CONFIRMED, prompted=True)
-            case ResponseState.CONSENTING, Tick() if self._expired(event.at):
                 return self._alarm(event.at, AlarmReason.USER_CONFIRMED, prompted=True)
             case ((ResponseState.ALARM | ResponseState.RECORDING), Dismissed()):
                 return self._reset(event.at)
