@@ -1,0 +1,5 @@
+{
+  "stressThreshold": 75,
+  "cooldownSeconds": 1800,
+  "listenerPort": 4300
+}

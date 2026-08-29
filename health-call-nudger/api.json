@@ -1,0 +1,80 @@
+{
+  "service": "health-call-nudger",
+  "description": "Accepts a stress score and places an outbound coaching phone call via the ElevenLabs Conversational AI Twilio integration.",
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/nudge",
+      "description": "Trigger a nudge call. Skipped when the score is below stressThreshold or a call was placed within cooldownSeconds. Responds immediately; the call is placed asynchronously.",
+      "body": {
+        "score": "number (0-100, required)",
+        "context": "string (optional, short description surfaced in the spoken message)"
+      },
+      "responses": {
+        "200": "{ \"status\": \"ok\" } | { \"status\": \"skipped\", \"reason\": \"below_threshold\" } | { \"status\": \"skipped\", \"reason\": \"cooldown\", \"retryAfterSeconds\": number }",
+        "400": "{ \"status\": \"error\", \"error\": string }"
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/test-call",
+      "description": "Place a call directly with the supplied message, bypassing scoring, threshold and cooldown. For verifying the ElevenLabs/Twilio connection in isolation. Waits for the ElevenLabs response.",
+      "body": { "message": "string (required, non-empty)" },
+      "responses": {
+        "200": "{ \"status\": \"ok\", \"result\": object }",
+        "400": "{ \"status\": \"error\", \"error\": string }",
+        "502": "{ \"status\": \"error\", \"stage\": \"elevenlabs_call\", \"error\": string, \"details\": object }"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/status",
+      "description": "Current counters and readiness.",
+      "responses": {
+        "200": "{ \"nudgeCount\": number, \"lastNudgeAt\": string|null, \"cooldownActive\": boolean, \"callingConfigured\": boolean, \"missingEnv\": string[] }"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/config",
+      "description": "Read non-secret config.",
+      "responses": { "200": "{ \"stressThreshold\": number, \"cooldownSeconds\": number, \"listenerPort\": number }" }
+    },
+    {
+      "method": "PATCH",
+      "path": "/config",
+      "description": "Update non-secret config and persist to config.json. Secrets are never readable or writable here. listenerPort changes take effect on restart.",
+      "body": {
+        "stressThreshold": "number (optional)",
+        "cooldownSeconds": "number (optional)",
+        "listenerPort": "number (optional)"
+      },
+      "responses": {
+        "200": "{ \"status\": \"ok\", \"config\": object }",
+        "400": "{ \"status\": \"error\", \"error\": string }"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/",
+      "description": "This API description.",
+      "responses": { "200": "this document" }
+    }
+  ],
+  "env": [
+    "ELEVENLABS_API_KEY",
+    "ELEVENLABS_AGENT_ID",
+    "ELEVENLABS_PHONE_NUMBER_ID",
+    "TO_NUMBER"
+  ],
+  "upstream": {
+    "provider": "ElevenLabs Conversational AI",
+    "endpoint": "POST https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
+    "auth": "xi-api-key header"
+  },
+  "outOfScope": [
+    "health-data ingestion (Terra, Apple Health, wearables)",
+    "LLM-based message generation",
+    "decision-maker / monitor service integration"
+  ]
+}
