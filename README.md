@@ -60,3 +60,63 @@ running sync --source synthetic --sink notion --since 1d
 The sink queries `External ID` before creating each page, so retries and
 re-syncs do not duplicate records. Rate-limited requests respect Notion's
 `Retry-After` response header.
+
+## Runner safety voice escalation
+
+The `alert` command is a mocked-HTTP-ready escalation path. Dry-run mode is
+safe for demos and requires no credentials:
+
+```bash
+running alert --lat 51.5387 --lon -0.0166 --dry-run
+```
+
+Live mode requires these environment variables:
+
+* `ELEVENLABS_API_KEY`
+* `ELEVENLABS_RUNNER_AGENT_ID`
+* `ELEVENLABS_CONTACT_AGENT_ID`
+* `ELEVENLABS_AGENT_PHONE_NUMBER_ID`
+* `TWILIO_ACCOUNT_SID`
+* `TWILIO_AUTH_TOKEN`
+* `TWILIO_FROM_NUMBER`
+* `RUNNER_PHONE_NUMBER`
+* `EMERGENCY_CONTACT_PHONE_NUMBER`
+
+Before enabling live mode, a human must create the runner and emergency
+contact agents in ElevenLabs, import the Twilio number to obtain the
+ElevenLabs Phone Number ID, verify the caller ID or buy a number, and confirm
+the account plan allows outbound calling. No live call has ever been made from
+this code.
+
+The ElevenLabs client uses `POST /v1/convai/twilio/outbound-call` and polls
+`GET /v1/convai/conversations/{conversation_id}`. The documented conversation
+statuses are `initiated`, `in-progress`, `processing`, `done`, and `failed`;
+unrecognised values map to `unknown`.
+
+## In-app call mode
+
+The runner leg can instead use an ElevenLabs in-app WebRTC/WebSocket
+conversation, with no runner phone number required. Set these environment
+variables:
+
+* `ELEVENLABS_API_KEY`
+* `ELEVENLABS_RUNNER_AGENT_ID`
+* `ELEVENLABS_CONTACT_AGENT_ID`
+
+Start the token-minting demo server with either:
+
+```bash
+running-app
+# or
+python -m running.app.server
+```
+
+The server listens on `127.0.0.1` unless `HOST` says otherwise: the
+credential-minting endpoints have no authentication, so anyone who can reach
+them can start a conversation on the account. Add authentication before binding
+it to a public interface.
+
+The ElevenLabs API key never reaches the browser. The server uses it to mint
+short-lived conversation tokens or signed URLs, then returns only those
+temporary credentials to the app. The emergency-contact leg still requires
+real telephony configuration because the contact does not have the app.
