@@ -6,7 +6,7 @@ from enum import StrEnum
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-def _utc_datetime(value: datetime) -> datetime:
+def ensure_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("datetime must be timezone-aware")
     return value.astimezone(UTC)
@@ -19,6 +19,7 @@ class Metric(StrEnum):
     RESPIRATORY_RATE = "respiratory_rate"
     ACTIVE_ENERGY = "active_energy"
     STRESS_SCORE = "stress_score"
+    SKIN_CONDUCTANCE = "skin_conductance"
 
 
 class HealthSample(BaseModel):
@@ -31,8 +32,8 @@ class HealthSample(BaseModel):
     end: datetime
     source: str
 
-    _validate_start = field_validator("start")(_utc_datetime)
-    _validate_end = field_validator("end")(_utc_datetime)
+    _validate_start = field_validator("start")(ensure_utc)
+    _validate_end = field_validator("end")(ensure_utc)
 
     @model_validator(mode="after")
     def validate_range(self) -> "HealthSample":
@@ -49,7 +50,7 @@ class GeoPoint(BaseModel):
     elevation_m: float | None = None
     timestamp: datetime
 
-    _validate_timestamp = field_validator("timestamp")(_utc_datetime)
+    _validate_timestamp = field_validator("timestamp")(ensure_utc)
 
 
 class WorkoutSession(BaseModel):
@@ -63,8 +64,8 @@ class WorkoutSession(BaseModel):
     route: list[GeoPoint] = Field(default_factory=list)
     samples: list[HealthSample] = Field(default_factory=list)
 
-    _validate_start = field_validator("start")(_utc_datetime)
-    _validate_end = field_validator("end")(_utc_datetime)
+    _validate_start = field_validator("start")(ensure_utc)
+    _validate_end = field_validator("end")(ensure_utc)
 
     @model_validator(mode="after")
     def validate_range(self) -> "WorkoutSession":
@@ -79,8 +80,8 @@ class TimeWindow(BaseModel):
     start: datetime
     end: datetime
 
-    _validate_start = field_validator("start")(_utc_datetime)
-    _validate_end = field_validator("end")(_utc_datetime)
+    _validate_start = field_validator("start")(ensure_utc)
+    _validate_end = field_validator("end")(ensure_utc)
 
     @model_validator(mode="after")
     def validate_range(self) -> "TimeWindow":

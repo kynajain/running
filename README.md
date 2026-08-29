@@ -89,3 +89,45 @@ running sync --source ndjson --export batch.ndjson --sink twilio \
 Both numbers must be E.164. On a Twilio trial account the destination has to be
 a number you verified in the console, and messages are prefixed with a trial
 notice. The alert is a nudge based on a heuristic, not medical advice.
+
+## Accident and stress detection
+
+`running.detection` holds the sensor-fusion and response layer that an app
+drives with live sensor data.
+
+Detection never compares a sensor against a fixed cut-off. `signals` regresses
+each metric on movement intensity derived from the accelerometer, then scores
+how far the latest reading sits from its activity-adjusted expectation: heart
+rate elevated beyond what the effort explains, HRV suppressed more steeply than
+exertion predicts, and — where hardware provides it — phasic skin-conductance
+bursts rather than tonic level, which rises with thermoregulatory sweat.
+`fusion` renormalises the weights over whichever detectors reported and refuses
+to fire on a single signal. Audio-based symptoms such as cough detection are
+deliberately absent; the signal-to-noise is not good enough to escalate on.
+
+Adding a sensor is implementing `SignalDetector` and calling
+`register_detector`; the fusion model does not change.
+
+`impact.detect_impact` reports a fall only when a hard impact, the deceleration
+preceding it, an orientation change across it and a post-impact window of
+near-zero movement all hold together.
+
+`response.ResponseMachine` is the pure state machine behind the escalation:
+
+```
+idle -> confirming -> consenting -> recording -> alarm
+```
+
+A crossed threshold opens an "Are you okay?" prompt with a 10-20s countdown
+that a single dismissal closes. Silence is treated as incapacitation and raises
+the alarm. Confirmed distress offers recording only if the user opted in during
+setup — never a live decision under stress, which keeps two-party audio consent
+informed — and raises the alarm either way. The machine performs no I/O: it
+returns effects (`ShowConfirmationPrompt`, `StartRecording`, `RaiseAlarm`, ...)
+for the caller to execute, so location lookup, cloud upload and contact
+notification stay replaceable.
+
+Apple hardware constrains what can be fed in: HealthKit exposes no
+electrodermal type and no continuous beat-to-beat intervals (so RMSSD and HF
+power are unavailable — SDNN is what you get), and iOS will not start camera
+capture from the background.
