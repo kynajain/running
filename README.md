@@ -21,9 +21,11 @@ development without an Apple device.
 
 Apple Health is iOS-only and has no cloud API. You can provide data through:
 
-1. The Health app's **Export All Health Data**, which creates `export.zip`.
-2. The [Health Auto Export](https://www.health-autoexport.com/) app.
-3. A third-party bridge such as [Terra](https://tryterra.co/) or
+1. The `RunningHealth` iOS app in [`ios/`](ios/README.md), which reads
+   HealthKit directly and pushes NDJSON.
+2. The Health app's **Export All Health Data**, which creates `export.zip`.
+3. The [Health Auto Export](https://www.health-autoexport.com/) app.
+4. A third-party bridge such as [Terra](https://tryterra.co/) or
    [Vital](https://www.tryvital.io/).
 
 For an Apple export, pass either the zip, its `export.xml`, or an extracted
@@ -32,6 +34,13 @@ directory:
 ```bash
 running sync --source apple_health --export ~/Downloads/export.zip \
   --sink jsonl --since 7d
+```
+
+Batches from the iOS app are NDJSON, one
+`{"type": "sample" | "workout", "record": {...}}` per line:
+
+```bash
+running sync --source ndjson --export batch.ndjson --sink jsonl --since 7d
 ```
 
 The stress score is an explicit heuristic, not an Apple Health metric. It
@@ -60,3 +69,23 @@ running sync --source synthetic --sink notion --since 1d
 The sink queries `External ID` before creating each page, so retries and
 re-syncs do not duplicate records. Rate-limited requests respect Notion's
 `Retry-After` response header.
+
+## Stress alerts over SMS
+
+The `twilio` sink texts you when a derived stress score crosses a threshold. It
+sends at most one message per sync — for the worst score in the batch — and
+keeps a cooldown in `.running-twilio-state.json` so an hourly sync cannot turn
+a bad day into a stream of texts.
+
+```bash
+export TWILIO_ACCOUNT_SID=AC...
+export TWILIO_AUTH_TOKEN=...
+export TWILIO_FROM_NUMBER=+15005550006
+export TWILIO_TO_NUMBER=+447700900123
+running sync --source ndjson --export batch.ndjson --sink twilio \
+  --since 1d --stress-threshold 75
+```
+
+Both numbers must be E.164. On a Twilio trial account the destination has to be
+a number you verified in the console, and messages are prefixed with a trial
+notice. The alert is a nudge based on a heuristic, not medical advice.

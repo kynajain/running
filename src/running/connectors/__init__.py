@@ -9,11 +9,13 @@ from running.connectors.base import (
     register_connector,
     register_sink,
 )
+from running.connectors.ndjson import NDJSONConnector
 from running.connectors.synthetic import SyntheticAppleHealthConnector
 
 __all__ = [
     "AppleHealthExportConnector",
     "HealthConnector",
+    "NDJSONConnector",
     "Sink",
     "SyntheticAppleHealthConnector",
     "get_connector",
