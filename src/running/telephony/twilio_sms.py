@@ -84,7 +84,12 @@ class TwilioSMSClient:
                 auth=(self.account_sid, self.auth_token),
                 data=form,
             )
-            retryable = response.status_code == 429 or 500 <= response.status_code <= 599
+            # Message creation is not idempotent: a 5xx can follow an accepted message,
+            # so only a 429 (rejected before any work) is repeated.
+            idempotent = method.upper() in {"GET", "HEAD"}
+            retryable = response.status_code == 429 or (
+                idempotent and 500 <= response.status_code <= 599
+            )
             if not retryable:
                 if response.is_error:
                     raise self._error(response)

@@ -11,6 +11,8 @@ dependencies = [
     "pydantic>=2.0",
     "httpx>=0.25",
     "python-dateutil>=2.8",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -24,9 +26,13 @@ dev = [
 
 [project.scripts]
 running = "running.cli:main"
+running-app = "running.app.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"running.app" = ["static/*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

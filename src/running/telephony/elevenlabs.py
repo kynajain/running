@@ -7,6 +7,7 @@ import random
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
 from typing import cast
+from urllib.parse import quote
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -43,6 +44,19 @@ class OutboundCallResponse(BaseModel):
     message: str = ""
     conversation_id: str | None = None
     call_sid: str | None = Field(default=None, validation_alias="callSid")
+
+
+class ConversationTokenResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    token: str
+    conversation_id: str | None = None
+
+
+class SignedUrlResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    signed_url: str
 
 
 class ConversationMetadata(BaseModel):
@@ -120,6 +134,22 @@ class ElevenLabsClient:
         )
         return OutboundCallResponse.model_validate(response.json())
 
+    async def get_conversation_token(self, agent_id: str) -> ConversationTokenResponse:
+        """Mint a short-lived WebRTC token so a client can talk to the agent in-app."""
+        response = await self._request(
+            "GET",
+            f"/v1/convai/conversation/token?agent_id={quote(agent_id, safe='')}",
+        )
+        return ConversationTokenResponse.model_validate(response.json())
+
+    async def get_signed_url(self, agent_id: str) -> SignedUrlResponse:
+        """Mint a signed WebSocket URL, used for text-only in-app conversations."""
+        response = await self._request(
+            "GET",
+            f"/v1/convai/conversation/get-signed-url?agent_id={quote(agent_id, safe='')}",
+        )
+        return SignedUrlResponse.model_validate(response.json())
+
     async def get_conversation(self, conversation_id: str) -> ConversationDetails:
         response = await self._request(
             "GET",
@@ -141,7 +171,13 @@ class ElevenLabsClient:
                 headers=headers,
                 json=payload,
             )
-            retryable = response.status_code == 429 or 500 <= response.status_code <= 599
+            # A 429 is rejected before any work happens, so it is safe to repeat for any
+            # method. A 5xx may follow an accepted submission, so only idempotent reads
+            # are repeated: retrying a call or message could reach the recipient twice.
+            idempotent = method.upper() in {"GET", "HEAD"}
+            retryable = response.status_code == 429 or (
+                idempotent and 500 <= response.status_code <= 599
+            )
             if not retryable:
                 if response.is_error:
                     raise self._error(response)

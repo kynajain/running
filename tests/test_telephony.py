@@ -214,7 +214,25 @@ async def test_elevenlabs_429_retries_with_retry_after() -> None:
     await client.aclose()
 
 
-async def test_twilio_5xx_retries() -> None:
+async def test_elevenlabs_post_5xx_does_not_retry() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(500, text="temporary")
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.elevenlabs.io"
+    )
+    elevenlabs = ElevenLabsClient("key", client=client)
+    with pytest.raises(ElevenLabsAPIError):
+        await elevenlabs.start_outbound_call("a", "p", "+441111111111")
+    assert attempts == 1
+    await client.aclose()
+
+
+async def test_twilio_429_retries() -> None:
     attempts = 0
     delays: list[float] = []
 
@@ -222,7 +240,7 @@ async def test_twilio_5xx_retries() -> None:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            return httpx.Response(502, text="temporary")
+            return httpx.Response(429, headers={"Retry-After": "0.25"})
         return httpx.Response(201, json={"sid": "SM1"})
 
     async def record_delay(delay: float) -> None:
@@ -233,6 +251,49 @@ async def test_twilio_5xx_retries() -> None:
     )
     twilio = TwilioSMSClient("sid", "token", client=client, sleep=record_delay)
     await twilio.send_sms("+441111111111", "+442222222222", "hello")
+    assert attempts == 2
+    assert delays == [0.25]
+    await client.aclose()
+
+
+async def test_twilio_post_5xx_does_not_retry() -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(500, text="temporary")
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.twilio.com"
+    )
+    twilio = TwilioSMSClient("sid", "token", client=client)
+    with pytest.raises(TwilioAPIError):
+        await twilio.send_sms("+441111111111", "+442222222222", "hello")
+    assert attempts == 1
+    await client.aclose()
+
+
+async def test_elevenlabs_get_5xx_retries_then_succeeds() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(500, text="temporary")
+        return httpx.Response(200, json={"status": "done", "metadata": {}})
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.elevenlabs.io"
+    )
+    elevenlabs = ElevenLabsClient("key", client=client, sleep=record_delay)
+    details = await elevenlabs.get_conversation("conversation-1")
+    assert details.status.value == "done"
     assert attempts == 2
     assert len(delays) == 1
     await client.aclose()
