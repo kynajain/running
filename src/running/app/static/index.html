@@ -236,22 +236,28 @@
         let sessionRegistered = false;
         let engagementPending = false;
         let engagementInFlight = false;
-        reportEngagement = async () => {
+        let engagementRequest = null;
+        reportEngagement = () => {
           engagementPending = true;
-          if (!sessionRegistered || engagementInFlight || engagementReported) return;
+          if (engagementInFlight || engagementRequest) return engagementRequest;
+          if (!sessionRegistered || engagementReported) return null;
           engagementInFlight = true;
-          try {
-            await json(
-              `/api/incident/${incident.incident_id}/session/${runnerSessionId}/engagement`,
-              {},
-            );
-            engagementPending = false;
-            engagementReported = true;
-          } catch (error) {
-            log(`Could not report engagement: ${error.message}`);
-          } finally {
-            engagementInFlight = false;
-          }
+          engagementRequest = (async () => {
+            try {
+              await json(
+                `/api/incident/${incident.incident_id}/session/${runnerSessionId}/engagement`,
+                {},
+              );
+              engagementPending = false;
+              engagementReported = true;
+            } catch (error) {
+              log(`Could not report engagement: ${error.message}`);
+            } finally {
+              engagementInFlight = false;
+              engagementRequest = null;
+            }
+          })();
+          return engagementRequest;
         };
 
         const voice = await micAvailable();
@@ -293,8 +299,12 @@
               els.compose.classList.remove("on");
               els.trigger.disabled = false;
               conversation = null;
-              if (engagementPending && !engagementReported) reportEngagement();
-              reportEngagement = async () => {};
+              const finishDisconnect = async () => {
+                if (engagementRequest) await engagementRequest;
+                if (engagementPending && !engagementReported) await reportEngagement();
+                reportEngagement = async () => {};
+              };
+              finishDisconnect();
               if (incident) {
                 json(`/api/incident/${incident.incident_id}`)
                   .then((state) => log(`Incident ${state.state} — runner session ${state.sessions[0]?.outcome ?? "pending"}.`))
