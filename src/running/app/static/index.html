@@ -133,6 +133,7 @@
       </div>
 
       <div class="row">
+        <button id="mic">Turn on voice</button>
         <button class="primary" id="trigger">Simulate incident</button>
         <button id="acknowledge" disabled>I'm okay</button>
         <button class="hangup" id="hangup" disabled>End call</button>
@@ -154,6 +155,7 @@
         orb: document.getElementById("orb"),
         who: document.getElementById("who"),
         trigger: document.getElementById("trigger"),
+        mic: document.getElementById("mic"),
         acknowledge: document.getElementById("acknowledge"),
         hangup: document.getElementById("hangup"),
         log: document.getElementById("log"),
@@ -196,13 +198,28 @@
         return response.json();
       }
 
+      const MIC_REASONS = {
+        NotAllowedError:
+          "the browser blocked it. Tap the padlock or aA in the address bar, set Microphone to Allow, then reload.",
+        NotFoundError: "this device has no microphone.",
+        NotReadableError: "another app is holding the microphone. Close it and try again.",
+        SecurityError: "this browser will not share a microphone here. Open the link in Safari or Chrome directly.",
+      };
+
       async function micAvailable() {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          log(
+            "Voice off: this browser cannot use a microphone here. Open the link in Safari or Chrome, not inside another app.",
+          );
+          return false;
+        }
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           stream.getTracks().forEach((track) => track.stop());
           return true;
         } catch (error) {
-          log(`No microphone (${error.name}) — falling back to text mode.`);
+          log(`Voice off: ${MIC_REASONS[error.name] ?? `the microphone failed (${error.name}).`}`);
+          log("Using typing instead so the demo still works.");
           return false;
         }
       }
@@ -217,7 +234,7 @@
         setStatus("Incident flagged. Connecting the safety assistant…", "alert");
         log("Tracker flagged a possible incident. Starting an in-app call.");
 
-        const voice = await micAvailable();
+        const micRequest = micAvailable();
 
         try {
           const triggered = await json("/api/trigger", {
@@ -233,6 +250,7 @@
         }
 
         els.acknowledge.disabled = false;
+        const incidentId = incident.incident_id;
         const runnerSessionId = incident.pending_session_id;
         let engagementReported = false;
         let sessionRegistered = false;
@@ -246,10 +264,7 @@
           engagementInFlight = true;
           engagementRequest = (async () => {
             try {
-              await json(
-                `/api/incident/${incident.incident_id}/session/${runnerSessionId}/engagement`,
-                {},
-              );
+              await json(`/api/incident/${incidentId}/session/${runnerSessionId}/engagement`, {});
               engagementPending = false;
               engagementReported = true;
             } catch (error) {
@@ -263,6 +278,7 @@
         };
         reportEngagement = ownReportEngagement;
 
+        const voice = await micRequest;
         let session;
         try {
           session = voice
@@ -307,8 +323,8 @@
                 if (reportEngagement === ownReportEngagement) reportEngagement = async () => {};
               };
               finishDisconnect();
-              if (incident) {
-                json(`/api/incident/${incident.incident_id}`)
+              {
+                json(`/api/incident/${incidentId}`)
                   .then((state) => log(`Incident ${state.state} — runner session ${state.sessions[0]?.outcome ?? "pending"}.`))
                   .catch(() => {});
               }
@@ -339,12 +355,12 @@
           log("No conversation id — the backend cannot verify engagement for this session.");
           return;
         }
-        await json(`/api/incident/${incident.incident_id}/session`, {
+        await json(`/api/incident/${incidentId}/session`, {
           session_id: runnerSessionId,
           conversation_id: conversationId,
         }).then(() => {
           sessionRegistered = true;
-          if (engagementPending && !engagementReported) reportEngagement();
+          if (engagementPending && !engagementReported) ownReportEngagement();
         }).catch((error) => log(`Could not register the session: ${error.message}`));
       }
 
@@ -362,6 +378,13 @@
         if (event.key === "Enter") sendReply();
       });
       els.trigger.addEventListener("click", startCall);
+      els.mic.addEventListener("click", async () => {
+        els.mic.disabled = true;
+        const ok = await micAvailable();
+        els.mic.disabled = false;
+        els.mic.textContent = ok ? "Voice ready" : "Turn on voice";
+        if (ok) log("Microphone allowed. The assistant will speak when you start the call.");
+      });
       els.acknowledge.addEventListener("click", async () => {
         if (!incident) return;
         els.acknowledge.disabled = true;
