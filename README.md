@@ -61,47 +61,26 @@ The sink queries `External ID` before creating each page, so retries and
 re-syncs do not duplicate records. Rate-limited requests respect Notion's
 `Retry-After` response header.
 
-## Runner safety voice escalation
+## In-app call mode
 
-The `alert` command is a mocked-HTTP-ready escalation path. Dry-run mode is
-safe for demos and requires no credentials:
+The runner leg is an in-app ElevenLabs WebRTC/WebSocket conversation and
+requires the app to be open on her device. The emergency contact receives an
+SMS only; there is no voice call to the contact. A session that connects but
+hears nothing is treated as unanswered and escalates.
 
-```bash
-running alert --lat 51.5387 --lon -0.0166 --dry-run
-```
-
-Live mode requires these environment variables:
+Set these environment variables:
 
 * `ELEVENLABS_API_KEY`
-* `ELEVENLABS_RUNNER_AGENT_ID`
-* `ELEVENLABS_CONTACT_AGENT_ID`
-* `ELEVENLABS_AGENT_PHONE_NUMBER_ID`
+* `ELEVENLABS_AGENT_ID`
+* `APP_TOKEN`
 * `TWILIO_ACCOUNT_SID`
 * `TWILIO_AUTH_TOKEN`
 * `TWILIO_FROM_NUMBER`
-* `RUNNER_PHONE_NUMBER`
-* `EMERGENCY_CONTACT_PHONE_NUMBER`
-
-Before enabling live mode, a human must create the runner and emergency
-contact agents in ElevenLabs, import the Twilio number to obtain the
-ElevenLabs Phone Number ID, verify the caller ID or buy a number, and confirm
-the account plan allows outbound calling. No live call has ever been made from
-this code.
-
-The ElevenLabs client uses `POST /v1/convai/twilio/outbound-call` and polls
-`GET /v1/convai/conversations/{conversation_id}`. The documented conversation
-statuses are `initiated`, `in-progress`, `processing`, `done`, and `failed`;
-unrecognised values map to `unknown`.
-
-## In-app call mode
-
-The runner leg can instead use an ElevenLabs in-app WebRTC/WebSocket
-conversation, with no runner phone number required. Set these environment
-variables:
-
-* `ELEVENLABS_API_KEY`
-* `ELEVENLABS_RUNNER_AGENT_ID`
-* `ELEVENLABS_CONTACT_AGENT_ID`
+* `CONTACT_PHONE_NUMBER`
+* `ESCALATION_DELAY_SECONDS` (optional, default `120`)
+* `SESSION_MAX_SECONDS` (optional, default `90`)
+* `HOST` (optional, default `127.0.0.1`)
+* `PORT` (optional, default `8000`)
 
 Start the token-minting demo server with either:
 
@@ -118,5 +97,12 @@ it to a public interface.
 
 The ElevenLabs API key never reaches the browser. The server uses it to mint
 short-lived conversation tokens or signed URLs, then returns only those
-temporary credentials to the app. The emergency-contact leg still requires
-real telephony configuration because the contact does not have the app.
+temporary credentials to the app. The API routes require the configured
+`APP_TOKEN`; `/healthz` is public. The emergency-contact SMS is sent through
+Twilio after the escalation delay if the runner has not explicitly
+acknowledged or produced a non-empty user transcript turn.
+
+The in-memory incident state machine, credential minting, and mocked HTTP
+tests have been exercised locally. The in-app runner conversation was also
+exercised against a real ElevenLabs account in the browser. No live Twilio SMS
+has been sent by this code.

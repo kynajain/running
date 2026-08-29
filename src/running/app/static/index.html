@@ -134,6 +134,7 @@
 
       <div class="row">
         <button class="primary" id="trigger">Simulate incident</button>
+        <button id="acknowledge" disabled>I'm okay</button>
         <button class="hangup" id="hangup" disabled>End call</button>
         <div class="compose" id="compose">
           <input id="reply" placeholder="Type a reply" autocomplete="off" />
@@ -153,6 +154,7 @@
         orb: document.getElementById("orb"),
         who: document.getElementById("who"),
         trigger: document.getElementById("trigger"),
+        acknowledge: document.getElementById("acknowledge"),
         hangup: document.getElementById("hangup"),
         log: document.getElementById("log"),
         compose: document.getElementById("compose"),
@@ -160,7 +162,12 @@
         send: document.getElementById("send"),
       };
 
+      const LOCATION = { latitude: 51.5387, longitude: -0.0166, fix_age_seconds: 42 };
+      const APP_TOKEN =
+        new URLSearchParams(location.search).get("token") ?? location.hash.slice(1);
+
       let conversation = null;
+      let incident = null;
 
       function setStatus(text, state = "") {
         els.status.textContent = text;
@@ -175,8 +182,15 @@
         els.log.scrollTop = els.log.scrollHeight;
       }
 
-      async function json(path) {
-        const response = await fetch(path);
+      async function json(path, body) {
+        const response = await fetch(path, {
+          method: body === undefined ? "GET" : "POST",
+          headers: {
+            Authorization: `Bearer ${APP_TOKEN}`,
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
         if (!response.ok) throw new Error(`${path} failed (${response.status})`);
         return response.json();
       }
@@ -192,18 +206,39 @@
         }
       }
 
-      async function startCall(leg) {
+      function fixAge(seconds) {
+        if (seconds < 90) return `${seconds} seconds ago`;
+        return `${Math.round(seconds / 60)} minutes ago`;
+      }
+
+      async function startCall() {
         els.trigger.disabled = true;
         setStatus("Incident flagged. Connecting the safety assistant…", "alert");
         log("Tracker flagged a possible incident. Starting an in-app call.");
+
+        try {
+          const triggered = await json("/api/trigger", {
+            message: "Your watch flagged a possible fall during your run.",
+            ...LOCATION,
+          });
+          incident = (await json(`/api/incident/current?role=runner`)).incident;
+          if (!incident) throw new Error(`incident ${triggered.incident_id} has no runner session`);
+        } catch (error) {
+          setStatus("Could not raise the incident.", "alert");
+          log(`Trigger failed: ${error.message}`);
+          els.trigger.disabled = false;
+          return;
+        }
+
+        els.acknowledge.disabled = false;
 
         const voice = await micAvailable();
         let session;
         try {
           session = voice
-            ? { conversationToken: (await json(`/api/conversation-token?leg=${leg}`)).token }
+            ? { conversationToken: (await json(`/api/conversation-token?leg=runner`)).token }
             : {
-                signedUrl: (await json(`/api/signed-url?leg=${leg}`)).signed_url,
+                signedUrl: (await json(`/api/signed-url?leg=runner`)).signed_url,
                 textOnly: true,
                 overrides: { conversation: { textOnly: true } },
               };
@@ -217,6 +252,12 @@
         try {
           conversation = await Conversation.startSession({
             ...session,
+            dynamicVariables: {
+              incident_message: incident.message,
+              latitude: String(incident.latitude),
+              longitude: String(incident.longitude),
+              location_fix_age: fixAge(incident.fix_age_seconds),
+            },
             onConnect: () => {
               setStatus(voice ? "In-app call connected." : "In-app chat connected (no mic).", "live");
               els.hangup.disabled = false;
@@ -230,6 +271,11 @@
               els.compose.classList.remove("on");
               els.trigger.disabled = false;
               conversation = null;
+              if (incident) {
+                json(`/api/incident/${incident.incident_id}`)
+                  .then((state) => log(`Incident ${state.state} — runner session ${state.sessions[0]?.outcome ?? "pending"}.`))
+                  .catch(() => {});
+              }
             },
             onMessage: ({ message, source }) => {
               log(message, source === "ai" ? "agent" : "user");
@@ -248,7 +294,18 @@
           setStatus("Could not start the call.", "alert");
           log(`startSession failed: ${error.message}`);
           els.trigger.disabled = false;
+          return;
         }
+
+        const conversationId = conversation.getId?.();
+        if (!conversationId) {
+          log("No conversation id — the backend cannot verify engagement for this session.");
+          return;
+        }
+        await json(`/api/incident/${incident.incident_id}/session`, {
+          session_id: incident.pending_session_id,
+          conversation_id: conversationId,
+        }).catch((error) => log(`Could not register the session: ${error.message}`));
       }
 
       function sendReply() {
@@ -263,7 +320,19 @@
       els.reply.addEventListener("keydown", (event) => {
         if (event.key === "Enter") sendReply();
       });
-      els.trigger.addEventListener("click", () => startCall("runner"));
+      els.trigger.addEventListener("click", startCall);
+      els.acknowledge.addEventListener("click", async () => {
+        if (!incident) return;
+        els.acknowledge.disabled = true;
+        try {
+          await json(`/api/incident/${incident.incident_id}/acknowledge`, {});
+          setStatus("Acknowledged. Escalation stopped.", "");
+          log("Runner acknowledged she is okay. Emergency contact will not be texted.");
+        } catch (error) {
+          els.acknowledge.disabled = false;
+          log(`Acknowledge failed: ${error.message}`);
+        }
+      });
       els.hangup.addEventListener("click", async () => {
         els.hangup.disabled = true;
         await conversation?.endSession();

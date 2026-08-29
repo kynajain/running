@@ -37,15 +37,6 @@ class ConversationStatus(StrEnum):
         return self in {ConversationStatus.DONE, ConversationStatus.FAILED}
 
 
-class OutboundCallResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-
-    success: bool = True
-    message: str = ""
-    conversation_id: str | None = None
-    call_sid: str | None = Field(default=None, validation_alias="callSid")
-
-
 class ConversationTokenResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -66,12 +57,21 @@ class ConversationMetadata(BaseModel):
     call_duration_secs: int = 0
 
 
+class TranscriptEntry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    role: str
+    message: str | None = None
+    time_in_call_secs: int = 0
+
+
 class ConversationDetails(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     agent_id: str = ""
     status: ConversationStatus = ConversationStatus.UNKNOWN
     metadata: ConversationMetadata = Field(default_factory=ConversationMetadata)
+    transcript: list[TranscriptEntry] = Field(default_factory=list)
 
     @field_validator("status", mode="before")
     @classmethod
@@ -113,26 +113,6 @@ class ElevenLabsClient:
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         await self.aclose()
-
-    async def start_outbound_call(
-        self,
-        agent_id: str,
-        agent_phone_number_id: str,
-        to_number: str,
-        call_recording_enabled: bool = False,
-    ) -> OutboundCallResponse:
-        response = await self._request(
-            "POST",
-            "/v1/convai/twilio/outbound-call",
-            {
-                "agent_id": agent_id,
-                "agent_phone_number_id": agent_phone_number_id,
-                "to_number": to_number,
-                # Docs also expose telephony_call_config.twilio_call_recording_enabled.
-                "call_recording_enabled": call_recording_enabled,
-            },
-        )
-        return OutboundCallResponse.model_validate(response.json())
 
     async def get_conversation_token(self, agent_id: str) -> ConversationTokenResponse:
         """Mint a short-lived WebRTC token so a client can talk to the agent in-app."""

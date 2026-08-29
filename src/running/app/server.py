@@ -7,21 +7,38 @@ ElevenLabs with it.
 
 from __future__ import annotations
 
+import asyncio
+import hmac
 import os
+import re
+import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
+from running.app.incident import (
+    CurrentIncidentResponse,
+    IncidentManager,
+    IncidentNotFoundError,
+    IncidentState,
+    IncidentSummary,
+    IncidentView,
+    SessionNotFoundError,
+    SessionPayload,
+    SessionResponse,
+    TriggerPayload,
+    TriggerResponse,
+)
 from running.telephony.elevenlabs import ElevenLabsAPIError, ElevenLabsClient
+from running.telephony.twilio_sms import TwilioSMSClient
 
 STATIC_DIR = Path(__file__).parent / "static"
-
-Leg = Literal["runner", "contact"]
+_E164 = re.compile(r"^\+[1-9]\d{1,14}$")
 
 
 class AppConfigurationError(RuntimeError):
@@ -32,15 +49,25 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     elevenlabs_api_key: SecretStr
+    app_token: SecretStr
     runner_agent_id: str
-    contact_agent_id: str
+    twilio_account_sid: SecretStr
+    twilio_auth_token: SecretStr
+    twilio_from_number: str
+    contact_phone_number: str
+    escalation_delay_seconds: float = Field(default=120.0, gt=0)
+    session_max_seconds: float = Field(default=90.0, gt=0)
 
     @classmethod
     def from_env(cls) -> AppConfig:
         names = {
             "ELEVENLABS_API_KEY": "elevenlabs_api_key",
-            "ELEVENLABS_RUNNER_AGENT_ID": "runner_agent_id",
-            "ELEVENLABS_CONTACT_AGENT_ID": "contact_agent_id",
+            "ELEVENLABS_AGENT_ID": "runner_agent_id",
+            "APP_TOKEN": "app_token",
+            "TWILIO_ACCOUNT_SID": "twilio_account_sid",
+            "TWILIO_AUTH_TOKEN": "twilio_auth_token",
+            "TWILIO_FROM_NUMBER": "twilio_from_number",
+            "CONTACT_PHONE_NUMBER": "contact_phone_number",
         }
         missing = [env_name for env_name in names if not os.environ.get(env_name)]
         if missing:
@@ -49,12 +76,22 @@ class AppConfig(BaseModel):
             )
         return cls(
             elevenlabs_api_key=SecretStr(os.environ["ELEVENLABS_API_KEY"]),
-            runner_agent_id=os.environ["ELEVENLABS_RUNNER_AGENT_ID"],
-            contact_agent_id=os.environ["ELEVENLABS_CONTACT_AGENT_ID"],
+            runner_agent_id=os.environ["ELEVENLABS_AGENT_ID"],
+            app_token=SecretStr(os.environ["APP_TOKEN"]),
+            twilio_account_sid=SecretStr(os.environ["TWILIO_ACCOUNT_SID"]),
+            twilio_auth_token=SecretStr(os.environ["TWILIO_AUTH_TOKEN"]),
+            twilio_from_number=os.environ["TWILIO_FROM_NUMBER"],
+            contact_phone_number=os.environ["CONTACT_PHONE_NUMBER"],
+            escalation_delay_seconds=float(os.environ.get("ESCALATION_DELAY_SECONDS", "120")),
+            session_max_seconds=float(os.environ.get("SESSION_MAX_SECONDS", "90")),
         )
 
-    def agent_id(self, leg: Leg) -> str:
-        return self.runner_agent_id if leg == "runner" else self.contact_agent_id
+    @field_validator("twilio_from_number", "contact_phone_number")
+    @classmethod
+    def validate_phone_number(cls, value: str) -> str:
+        if not _E164.fullmatch(value):
+            raise ValueError("phone number must use E.164 format")
+        return value
 
     def __str__(self) -> str:
         return "AppConfig(<credentials redacted>)"
@@ -67,7 +104,7 @@ class ConversationTokenPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     token: str
-    conversation_id: str | None
+    conversation_id: str | None = None
     agent_id: str
 
 
@@ -78,13 +115,50 @@ class SignedUrlPayload(BaseModel):
     agent_id: str
 
 
-def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> FastAPI:
+Clock = Callable[[], float]
+Sleep = Callable[[float], Awaitable[None]]
+
+
+def create_app(
+    config: AppConfig,
+    client: httpx.AsyncClient | None = None,
+    sms_client: httpx.AsyncClient | None = None,
+    clock: Clock = time.monotonic,
+    sleep: Sleep = asyncio.sleep,
+) -> FastAPI:
     app = FastAPI(title="Runner safety in-app calls")
     elevenlabs = ElevenLabsClient(config.elevenlabs_api_key.get_secret_value(), client=client)
+    twilio = TwilioSMSClient(
+        config.twilio_account_sid.get_secret_value(),
+        config.twilio_auth_token.get_secret_value(),
+        client=sms_client,
+    )
+    incidents = IncidentManager(
+        runner_agent_id=config.runner_agent_id,
+        contact_phone_number=config.contact_phone_number,
+        twilio_from_number=config.twilio_from_number,
+        elevenlabs=elevenlabs,
+        twilio=twilio,
+        escalation_delay_seconds=config.escalation_delay_seconds,
+        session_max_seconds=config.session_max_seconds,
+        clock=clock,
+        sleep=sleep,
+    )
+    app.state.incidents = incidents
+
+    def require_auth(authorization: str | None = Header(default=None)) -> None:
+        expected = f"Bearer {config.app_token.get_secret_value()}"
+        if authorization is None or not hmac.compare_digest(authorization, expected):
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
     @app.get("/api/conversation-token", response_model=ConversationTokenPayload)
-    async def conversation_token(leg: Leg = "runner") -> ConversationTokenPayload:
-        agent_id = config.agent_id(leg)
+    async def conversation_token(
+        leg: str = "runner",
+        _: None = Depends(require_auth),
+    ) -> ConversationTokenPayload:
+        if leg != "runner":
+            raise HTTPException(status_code=400, detail="Only the runner leg has an in-app session")
+        agent_id = config.runner_agent_id
         try:
             token = await elevenlabs.get_conversation_token(agent_id)
         except ElevenLabsAPIError as exc:
@@ -99,9 +173,14 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> Fa
         )
 
     @app.get("/api/signed-url", response_model=SignedUrlPayload)
-    async def signed_url(leg: Leg = "runner") -> SignedUrlPayload:
+    async def signed_url(
+        leg: str = "runner",
+        _: None = Depends(require_auth),
+    ) -> SignedUrlPayload:
         """WebSocket credential for the text-only fallback when there is no microphone."""
-        agent_id = config.agent_id(leg)
+        if leg != "runner":
+            raise HTTPException(status_code=400, detail="Only the runner leg has an in-app session")
+        agent_id = config.runner_agent_id
         try:
             signed = await elevenlabs.get_signed_url(agent_id)
         except ElevenLabsAPIError as exc:
@@ -111,13 +190,81 @@ def create_app(config: AppConfig, client: httpx.AsyncClient | None = None) -> Fa
             ) from exc
         return SignedUrlPayload(signed_url=signed.signed_url, agent_id=agent_id)
 
+    @app.post("/api/trigger", response_model=TriggerResponse, status_code=201)
+    @app.post("/api/panic", response_model=TriggerResponse, status_code=201)
+    async def trigger(
+        payload: TriggerPayload,
+        _: None = Depends(require_auth),
+    ) -> TriggerResponse:
+        incident = await incidents.create(payload)
+        return TriggerResponse(incident_id=incident.incident_id, state=incident.state)
+
+    @app.get("/api/incident/current", response_model=CurrentIncidentResponse)
+    async def current(
+        role: str = "runner",
+        _: None = Depends(require_auth),
+    ) -> CurrentIncidentResponse:
+        if role not in {"runner", "contact"}:
+            raise HTTPException(status_code=400, detail="Invalid role")
+        incident = await incidents.current(role)
+        if incident is None:
+            return CurrentIncidentResponse(incident=None)
+        return CurrentIncidentResponse(
+            incident=IncidentSummary(
+                incident_id=incident.incident_id,
+                message=incident.message,
+                state=incident.state,
+                latitude=incident.latitude,
+                longitude=incident.longitude,
+                fix_age_seconds=incident.fix_age_seconds,
+                pending_session_id=incident.pending_session_id,
+            )
+        )
+
+    @app.post("/api/incident/{incident_id}/session", response_model=SessionResponse)
+    async def session(
+        incident_id: str,
+        payload: SessionPayload,
+        _: None = Depends(require_auth),
+    ) -> SessionResponse:
+        try:
+            outcome = await incidents.attach_session(incident_id, payload)
+        except IncidentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Incident not found") from exc
+        except SessionNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Session not found") from exc
+        return SessionResponse(outcome=outcome)
+
+    @app.post("/api/incident/{incident_id}/acknowledge")
+    async def acknowledge(
+        incident_id: str,
+        _: None = Depends(require_auth),
+    ) -> dict[str, str]:
+        try:
+            await incidents.acknowledge(incident_id)
+        except (IncidentNotFoundError, SessionNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail="Incident not found") from exc
+        return {"state": IncidentState.RESOLVED, "outcome": "answered"}
+
+    @app.get("/api/incident/{incident_id}", response_model=IncidentView)
+    async def incident(
+        incident_id: str,
+        _: None = Depends(require_auth),
+    ) -> IncidentView:
+        try:
+            return await incidents.view(incident_id)
+        except IncidentNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Incident not found") from exc
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
+        await incidents.close()
         await elevenlabs.aclose()
+        await twilio.aclose()
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
