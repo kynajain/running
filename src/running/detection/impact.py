@@ -23,6 +23,8 @@ STILLNESS_TOLERANCE_G = 0.15
 SETTLE = timedelta(seconds=0.5)
 ORIENTATION_WINDOW = timedelta(seconds=2)
 JERK_WINDOW = timedelta(seconds=0.3)
+MAX_GAP = timedelta(seconds=1)
+"""Largest tolerated hole in the stillness window; above it, coverage is unproven."""
 
 
 def detect_impact(
@@ -135,13 +137,23 @@ def _stillness(
     limit: timedelta,
     tolerance: float,
 ) -> timedelta | None:
-    """Duration of near-zero motion from ``start``, or ``None`` if too short."""
+    """Duration of near-zero motion from ``start``, or ``None`` if too short.
 
-    window = _slice(samples, start, start + limit)
+    The whole interval must be covered by readings that are all at rest.
+    Coverage is judged by gaps rather than by a sample landing exactly on the
+    deadline, which real timestamps rarely do.
+    """
+
+    deadline = start + limit
+    window = _slice(samples, start, deadline)
     if not window:
         return None
+
     for sample in window:
         if abs(sample.magnitude - 1.0) > tolerance:
             return None
-    covered = window[-1].timestamp - start
-    return covered if covered >= limit else None
+
+    edges = [start, *(sample.timestamp for sample in window), deadline]
+    if any(later - earlier > MAX_GAP for earlier, later in zip(edges, edges[1:], strict=False)):
+        return None
+    return limit

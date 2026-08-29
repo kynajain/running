@@ -114,3 +114,35 @@ def test_stillness_window_must_be_covered() -> None:
 
 def test_empty_input() -> None:
     assert detect_impact([]) is None
+
+
+def test_stillness_tolerates_sampling_jitter_around_the_deadline() -> None:
+    """Readings that straddle the deadline without landing on it still count."""
+
+    offset = [
+        MotionSample(timestamp=at(3.53 + step * 0.07), x=1.0, y=0.0, z=0.0)
+        for step in range(int(9 / 0.07))
+    ]
+    jittered = [
+        *steady(0, 3, upright=True, jitter=0.25),
+        MotionSample(timestamp=at(3.0), x=0.0, y=0.0, z=0.1),
+        MotionSample(timestamp=at(3.05), x=0.0, y=0.0, z=6.0),
+        *offset,
+    ]
+
+    event = detect_impact(jittered)
+
+    assert event is not None
+    assert event.still_for_s == 7.0
+
+
+def test_stillness_rejects_a_hole_in_the_window() -> None:
+    gapped = [
+        *steady(0, 3, upright=True, jitter=0.25),
+        MotionSample(timestamp=at(3.0), x=0.0, y=0.0, z=0.1),
+        MotionSample(timestamp=at(3.05), x=0.0, y=0.0, z=6.0),
+        *steady(3.5, 2, upright=False),
+        *steady(8.0, 4, upright=False),
+    ]
+
+    assert detect_impact(gapped) is None
