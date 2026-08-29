@@ -92,3 +92,26 @@ The ElevenLabs client uses `POST /v1/convai/twilio/outbound-call` and polls
 `GET /v1/convai/conversations/{conversation_id}`. The documented conversation
 statuses are `initiated`, `in-progress`, `processing`, `done`, and `failed`;
 unrecognised values map to `unknown`.
+
+## In-app call mode
+
+The runner leg can instead use an ElevenLabs in-app WebRTC/WebSocket
+conversation, with no runner phone number required. Set these environment
+variables:
+
+* `ELEVENLABS_API_KEY`
+* `ELEVENLABS_RUNNER_AGENT_ID`
+* `ELEVENLABS_CONTACT_AGENT_ID`
+
+Start the token-minting demo server with either:
+
+```bash
+running-app
+# or
+python -m running.app.server
+```
+
+The ElevenLabs API key never reaches the browser. The server uses it to mint
+short-lived conversation tokens or signed URLs, then returns only those
+temporary credentials to the app. The emergency-contact leg still requires
+real telephony configuration because the contact does not have the app.
