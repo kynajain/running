@@ -1,0 +1,19 @@
+{
+  "name": "health-call-nudger",
+  "version": "1.0.0",
+  "description": "Standalone Node.js service that turns a stress score into an outbound coaching phone call via ElevenLabs Conversational AI + Twilio.",
+  "main": "health_call_nudger.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node health_call_nudger.js",
+    "tunnel": "node tunnel.js",
+    "smoke": "bash smoke.sh"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "axios": "1.19.0",
+    "dotenv": "17.4.2"
+  }
+}
