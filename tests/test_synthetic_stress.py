@@ -45,3 +45,14 @@ def test_stress_is_higher_for_low_hrv_and_high_rhr() -> None:
     ]
     scores = compute_stress_scores(samples)
     assert scores[1].value > scores[0].value
+
+
+def test_stress_ignores_resting_hr_more_than_day_away() -> None:
+    base = [
+        sample(Metric.HRV_SDNN, 50, 0),
+        sample(Metric.RESTING_HEART_RATE, 55, 0),
+        sample(Metric.HRV_SDNN, 10, 2880),
+    ]
+    high_far_rhr = compute_stress_scores(base + [sample(Metric.RESTING_HEART_RATE, 200, 5760)])
+    low_far_rhr = compute_stress_scores(base + [sample(Metric.RESTING_HEART_RATE, 55, 5760)])
+    assert high_far_rhr[1].value == low_far_rhr[1].value

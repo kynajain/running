@@ -5,25 +5,28 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import running.sinks as _registered_sinks  # noqa: F401
 from running.connectors import get_connector, get_sink
+from running.connectors.base import ClosableSink
 from running.models import TimeWindow
 from running.workers import SyncJob, SyncReport, SyncWorkerPool
 
 
 def _duration(value: str) -> timedelta:
-    if not value.endswith("d"):
-        raise argparse.ArgumentTypeError("duration must look like 7d")
+    units = {"m": "minutes", "h": "hours", "d": "days"}
+    if not value or value[-1] not in units:
+        raise argparse.ArgumentTypeError("duration must look like 90m, 12h, or 7d")
     try:
-        days = float(value[:-1])
+        amount = float(value[:-1])
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("duration must look like 7d") from exc
-    if days <= 0:
+        raise argparse.ArgumentTypeError("duration must look like 90m, 12h, or 7d") from exc
+    if amount <= 0:
         raise argparse.ArgumentTypeError("duration must be positive")
-    return timedelta(days=days)
+    return timedelta(**{units[value[-1]]: amount})
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -52,12 +55,15 @@ async def _sync(args: argparse.Namespace) -> SyncReport:
         sink = get_sink(args.sink)()
     now = datetime.now(UTC)
     window = TimeWindow(start=now - args.since, end=now)
-    pool = SyncWorkerPool(
-        connectors={args.source: connector},
-        sinks={args.sink: sink},
-        concurrency=args.concurrency,
-    )
-    return await pool.run([SyncJob(args.source, window, args.sink)])
+    async with AsyncExitStack() as stack:
+        if isinstance(sink, ClosableSink):
+            stack.push_async_callback(sink.aclose)
+        pool = SyncWorkerPool(
+            connectors={args.source: connector},
+            sinks={args.sink: sink},
+            concurrency=args.concurrency,
+        )
+        return await pool.run([SyncJob(args.source, window, args.sink)])
 
 
 def main() -> None:

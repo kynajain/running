@@ -50,6 +50,48 @@ async def test_notion_create_and_dedupe() -> None:
     await client.aclose()
 
 
+async def test_notion_batches_dedupe_queries() -> None:
+    samples = [
+        make_sample(),
+        make_sample().model_copy(update={"value": 121}),
+        make_sample().model_copy(update={"value": 122}),
+    ]
+    existing_id = NotionSink._sample_id(samples[1])
+    queries = 0
+    creates = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal queries, creates
+        if request.url.path.endswith("/query"):
+            queries += 1
+            payload = request.content
+            assert existing_id.encode() in payload
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "properties": {
+                                "External ID": {"rich_text": [{"plain_text": existing_id}]}
+                            }
+                        }
+                    ],
+                    "next_cursor": None,
+                },
+            )
+        creates += 1
+        return httpx.Response(200, json={"id": str(creates)})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.notion.com/v1"
+    )
+    sink = NotionSink(token="token", database_id="database", client=client)
+    assert await sink.write_samples(samples) == 2
+    assert queries == 1
+    assert creates == 2
+    await client.aclose()
+
+
 async def test_notion_429_retry() -> None:
     attempts = 0
     delays: list[float] = []
@@ -70,9 +112,50 @@ async def test_notion_429_retry() -> None:
         client=client,
         sleep=lambda delay: _record_delay(delays, delay),
     )
-    assert await sink._exists("id") is False
+    assert await sink._existing_ids(["id"]) == set()
     assert attempts == 2
     assert delays == [0.1]
+    await client.aclose()
+
+
+async def test_notion_5xx_retry() -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(502)
+        return httpx.Response(200, json={"results": []})
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://api.notion.com/v1"
+    )
+    sink = NotionSink(
+        token="token",
+        database_id="database",
+        client=client,
+        sleep=lambda delay: _record_delay(delays, delay),
+    )
+    assert await sink._existing_ids(["id"]) == set()
+    assert attempts == 2
+    assert delays == [0.5]
+    await client.aclose()
+
+
+async def test_notion_owned_client_closes() -> None:
+    sink = NotionSink(token="token", database_id="database")
+    assert sink.client.is_closed is False
+    await sink.aclose()
+    assert sink.client.is_closed is True
+
+
+async def test_notion_injected_client_is_not_closed() -> None:
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+    sink = NotionSink(token="token", database_id="database", client=client)
+    await sink.aclose()
+    assert client.is_closed is False
     await client.aclose()
 
 
