@@ -111,6 +111,11 @@ running-app
 python -m running.app.server
 ```
 
+The server listens on `127.0.0.1` unless `HOST` says otherwise: the
+credential-minting endpoints have no authentication, so anyone who can reach
+them can start a conversation on the account. Add authentication before binding
+it to a public interface.
+
 The ElevenLabs API key never reaches the browser. The server uses it to mint
 short-lived conversation tokens or signed URLs, then returns only those
 temporary credentials to the app. The emergency-contact leg still requires
