@@ -23,6 +23,7 @@ const CALL_ENV = [
   'TO_NUMBER',
 ];
 const WEBHOOK_ENV = ['TERRA_SIGNING_SECRET'];
+const INGEST_ENV = ['DEVICE_TOKEN'];
 const ESCALATION_ENV = [
   'ELEVENLABS_ESCALATION_AGENT_ID',
   'EMERGENCY_CONTACT_NUMBER',
@@ -47,6 +48,8 @@ const WEBHOOK_RATE_WINDOW_MS = 60 * 1000;
 
 // These place real phone calls or change who gets called. They are never open.
 const ADMIN_ROUTES = ['POST /nudge', 'POST /test-call', 'POST /acknowledge', 'PATCH /config'];
+const DEVICE_ROUTES = ['POST /ingest'];
+const MAX_INGEST_BODY_BYTES = 64 * 1024;
 const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
 const START_TIME = Date.now();
@@ -58,10 +61,14 @@ const DEFAULT_CONFIG = {
   // Off until someone deliberately turns it on: escalation calls a third party.
   escalationEnabled: false,
   escalationDelaySeconds: 120,
+  // The runner's position is hers; sharing it with the contact is a choice, and
+  // a stale fix is worse than none, so it is read out only while it is fresh.
+  shareLocationWithContact: true,
+  locationMaxAgeSeconds: 900,
 };
 
 const CONFIG_KEYS = Object.keys(DEFAULT_CONFIG);
-const BOOLEAN_CONFIG_KEYS = ['escalationEnabled'];
+const BOOLEAN_CONFIG_KEYS = ['escalationEnabled', 'shareLocationWithContact'];
 
 class StagedError extends Error {
   constructor(stage, message, details) {
@@ -105,6 +112,8 @@ let state = {
   lastEscalationAt: null,
   acknowledgedAt: null,
   escalationLog: [],
+  lastLocation: null,
+  lastVitals: null,
   records: {},
 };
 
@@ -120,9 +129,15 @@ function loadConfig() {
       missingEnv: missingCall,
     });
   }
+  const missingIngest = missingEnv(INGEST_ENV);
+  if (missingIngest.length > 0) {
+    log('warn', 'startup', 'DEVICE_TOKEN is not set; /ingest will reject every app payload', {
+      missingEnv: missingIngest,
+    });
+  }
   const missingWebhook = missingEnv(WEBHOOK_ENV);
   if (missingWebhook.length > 0) {
-    log('warn', 'startup', 'Terra webhook is not configured; /webhook/terra will reject everything', {
+    log('info', 'startup', 'Legacy Terra webhook is not configured; /webhook/terra will reject everything', {
       missingEnv: missingWebhook,
     });
   }
@@ -142,7 +157,7 @@ function loadConfig() {
       adminRoutes: ADMIN_ROUTES,
     });
   }
-  return { config, missingEnv: [...missingCall, ...missingWebhook] };
+  return { config, missingEnv: [...missingCall, ...missingIngest, ...missingWebhook] };
 }
 
 function bindAddress() {
@@ -165,6 +180,10 @@ function loadState() {
     lastEscalationAt: typeof loaded.lastEscalationAt === 'string' ? loaded.lastEscalationAt : null,
     acknowledgedAt: typeof loaded.acknowledgedAt === 'string' ? loaded.acknowledgedAt : null,
     escalationLog: Array.isArray(loaded.escalationLog) ? loaded.escalationLog : [],
+    lastLocation:
+      loaded.lastLocation && typeof loaded.lastLocation === 'object' ? loaded.lastLocation : null,
+    lastVitals:
+      loaded.lastVitals && typeof loaded.lastVitals === 'object' ? loaded.lastVitals : null,
     records: loaded.records && typeof loaded.records === 'object' ? loaded.records : {},
   };
   return state;
@@ -214,7 +233,108 @@ function computeStressScore(payload) {
 }
 
 // ---------------------------------------------------------------------------
-// Terra webhook
+// App ingest (health data + live location pushed from the runner's phone)
+// ---------------------------------------------------------------------------
+
+// The app decides what "stress" means for its own signals; the service takes
+// the number and nothing else. Raw heart rate and HRV are stored for later
+// inspection but never scored here, for the same reason as the Terra path:
+// elevated HR is the expected state mid-run.
+function computeIngestStressScore(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const raw = payload.stress;
+  const value = typeof raw === 'number' ? raw : null;
+  if (value === null || !Number.isFinite(value)) return null;
+  return Math.min(100, Math.max(0, value));
+}
+
+function parseLocation(raw) {
+  if (raw === undefined || raw === null) return { location: null };
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return { error: 'location must be an object' };
+  }
+  const lat = raw.lat === undefined ? raw.latitude : raw.lat;
+  const lng = raw.lng === undefined ? raw.longitude : raw.lng;
+  if (typeof lat !== 'number' || !Number.isFinite(lat) || lat < -90 || lat > 90) {
+    return { error: 'location.lat must be a number between -90 and 90' };
+  }
+  if (typeof lng !== 'number' || !Number.isFinite(lng) || lng < -180 || lng > 180) {
+    return { error: 'location.lng must be a number between -180 and 180' };
+  }
+
+  // The phone's own timestamp, because a fix can be minutes old by the time it
+  // reaches us and the difference is what decides whether we read it out.
+  const at = typeof raw.at === 'string' && !Number.isNaN(Date.parse(raw.at)) ? raw.at : null;
+  return {
+    location: {
+      lat,
+      lng,
+      accuracyMeters: typeof raw.accuracyMeters === 'number' ? raw.accuracyMeters : null,
+      at: at || new Date().toISOString(),
+      receivedAt: new Date().toISOString(),
+      mapUrl: `https://maps.google.com/?q=${lat},${lng}`,
+    },
+  };
+}
+
+function locationAgeSeconds(location) {
+  if (!location || typeof location.at !== 'string') return null;
+  const age = (Date.now() - Date.parse(location.at)) / 1000;
+  return Number.isFinite(age) ? Math.max(0, Math.round(age)) : null;
+}
+
+// Only a fix we are willing to say out loud: sharing turned on, and recent
+// enough that it still describes where she is rather than where she was.
+function shareableLocation() {
+  if (!config.shareLocationWithContact) return { location: null, reason: 'sharing disabled' };
+  const location = state.lastLocation;
+  if (!location) return { location: null, reason: 'no location received' };
+  const age = locationAgeSeconds(location);
+  if (age === null) return { location: null, reason: 'location has no usable timestamp' };
+  if (age > config.locationMaxAgeSeconds) {
+    return { location: null, reason: `location is ${age}s old`, ageSeconds: age };
+  }
+  return { location, ageSeconds: age };
+}
+
+function recordIngest(payload) {
+  const parsed = parseLocation(payload.location);
+  if (parsed.error) return { error: parsed.error };
+
+  const score = computeIngestStressScore(payload);
+  if (payload.stress !== undefined && score === null) {
+    return { error: 'stress must be a number between 0 and 100' };
+  }
+
+  if (parsed.location) {
+    state.lastLocation = parsed.location;
+  }
+
+  const vitals = {};
+  for (const key of ['heartRate', 'hrv', 'stress', 'steps', 'pace']) {
+    if (typeof payload[key] === 'number' && Number.isFinite(payload[key])) {
+      vitals[key] = payload[key];
+    }
+  }
+  if (Object.keys(vitals).length > 0) {
+    state.lastVitals = { ...vitals, at: new Date().toISOString() };
+  }
+  saveState();
+
+  log('info', 'ingest', 'App payload accepted', {
+    score,
+    vitals: state.lastVitals,
+    hasLocation: Boolean(parsed.location),
+    locationAccuracyMeters: parsed.location ? parsed.location.accuracyMeters : null,
+  });
+
+  const context = typeof payload.context === 'string' ? payload.context : '';
+  const nudge = score === null ? { status: 'skipped', reason: 'no_stress_value' } : maybeNudge(score, context);
+  return { score, location: Boolean(parsed.location), nudge };
+}
+
+// ---------------------------------------------------------------------------
+// Terra webhook (legacy path — the app now pushes to /ingest directly)
 // ---------------------------------------------------------------------------
 
 // Mirrors terra-api's verifyTerraWebhookSignature: header is
@@ -383,12 +503,25 @@ function buildNudgeMessage(score, context) {
 function buildEscalationMessage(score, contactName) {
   const rounded = Math.round(score);
   const greeting = contactName ? `Hello ${contactName}.` : 'Hello.';
+
+  // Spoken coordinates are clumsy, but a voice call has nowhere else to put
+  // them, and the age matters as much as the position itself.
+  const shareable = shareableLocation();
+  let whereabouts = '';
+  if (shareable.location) {
+    const minutes = Math.max(1, Math.round(shareable.ageSeconds / 60));
+    whereabouts =
+      `Her phone last reported a position about ${minutes} minute${minutes === 1 ? '' : 's'} ago, ` +
+      `at latitude ${shareable.location.lat.toFixed(4)}, longitude ${shareable.location.lng.toFixed(4)}. ` +
+      `That is where her phone was, not necessarily where she is now. `;
+  }
+
   return (
     `${greeting} This is an automated check-in call, not a live person. ` +
     `You are listed as the contact for a runner using a wellbeing check-in service. ` +
-    `Her wearable reported an elevated stress reading of ${rounded}, and she did not answer ` +
+    `Her app reported an elevated stress reading of ${rounded}, and she did not answer ` +
     `an automated check-in call. This may well be nothing: the reading is not a confirmed ` +
-    `emergency, and the data can lag behind real events by several minutes. ` +
+    `emergency. ${whereabouts}` +
     `If you would like to, you may want to try contacting her directly. ` +
     `This call will not be repeated.`
   );
@@ -828,6 +961,22 @@ function rateLimited(ip) {
   return hits.length > WEBHOOK_RATE_LIMIT;
 }
 
+function tokenMatches(provided, token) {
+  if (typeof provided !== 'string' || provided.length !== token.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(token));
+}
+
+// The phone's credential is separate from ADMIN_TOKEN: revoking a lost handset
+// must not also revoke the operator's access, and vice versa.
+function deviceAuthorised(req) {
+  const token = process.env.DEVICE_TOKEN;
+  if (!token) return { ok: false, reason: 'DEVICE_TOKEN is not set; /ingest is closed' };
+  const provided = req.headers['x-device-token'];
+  return tokenMatches(provided, token)
+    ? { ok: true }
+    : { ok: false, reason: 'missing or invalid x-device-token' };
+}
+
 // No dev bypass: without ADMIN_TOKEN these routes are loopback-only.
 function adminAuthorised(req) {
   const token = process.env.ADMIN_TOKEN;
@@ -836,12 +985,9 @@ function adminAuthorised(req) {
       ? { ok: true }
       : { ok: false, reason: 'ADMIN_TOKEN is not set; admin routes are loopback-only' };
   }
-  const provided = req.headers['x-admin-token'];
-  if (typeof provided !== 'string' || provided.length !== token.length) {
-    return { ok: false, reason: 'missing or malformed x-admin-token' };
-  }
-  const ok = crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(token));
-  return ok ? { ok: true } : { ok: false, reason: 'invalid x-admin-token' };
+  return tokenMatches(req.headers['x-admin-token'], token)
+    ? { ok: true }
+    : { ok: false, reason: 'missing or invalid x-admin-token' };
 }
 
 function readRawBody(req, limitBytes = WEBHOOK_MAX_BODY_BYTES) {
@@ -933,6 +1079,36 @@ async function handleTerraWebhook(req, res) {
   }
 }
 
+// Public route, so it gets the same treatment as the webhook: rate limited,
+// body capped, and authenticated before anything is stored.
+async function handleIngest(req, res) {
+  const ip = clientIp(req);
+  if (rateLimited(ip)) {
+    log('warn', 'ingest', 'Rejected ingest: rate limit', { ip, limit: WEBHOOK_RATE_LIMIT });
+    sendJson(res, 429, { status: 'error', error: 'rate limit exceeded' });
+    return;
+  }
+
+  let payload;
+  try {
+    payload = parseJsonObject(await readRawBody(req, MAX_INGEST_BODY_BYTES));
+  } catch (err) {
+    log('warn', 'ingest', 'Rejected ingest: unreadable body', { ip, error: err.message });
+    sendJson(res, err.message === 'Request body too large' ? 413 : 400, {
+      status: 'error',
+      error: err.message,
+    });
+    return;
+  }
+
+  const result = recordIngest(payload);
+  if (result.error) {
+    sendJson(res, 400, { status: 'error', error: result.error });
+    return;
+  }
+  sendJson(res, 200, { status: 'ok', ...result });
+}
+
 async function handleNudge(req, res) {
   const body = await readBody(req);
   const score = body.score;
@@ -980,14 +1156,20 @@ function handleStatus(res) {
     lastCallOutcome: state.lastCallOutcome,
     cooldownActive: cooldownRemainingSeconds() > 0,
     callingConfigured: missingEnv(CALL_ENV).length === 0,
+    ingestConfigured: missingEnv(INGEST_ENV).length === 0,
     webhookConfigured: missingEnv(WEBHOOK_ENV).length === 0,
-    missingEnv: missingEnv([...CALL_ENV, ...WEBHOOK_ENV]),
+    missingEnv: missingEnv([...CALL_ENV, ...INGEST_ENV, ...WEBHOOK_ENV]),
+    lastVitals: state.lastVitals,
+    lastLocation: state.lastLocation
+      ? { ...state.lastLocation, ageSeconds: locationAgeSeconds(state.lastLocation) }
+      : null,
     escalation: {
       enabled: config.escalationEnabled,
       configured: missingEnv(ESCALATION_ENV).length === 0,
       missingEnv: missingEnv(ESCALATION_ENV),
       lastEscalationAt: state.lastEscalationAt,
       acknowledgedAt: state.acknowledgedAt,
+      locationWouldBeShared: Boolean(shareableLocation().location),
       recent: state.escalationLog.slice(-10),
     },
   });
@@ -1036,7 +1218,7 @@ async function handleConfigPatch(req, res) {
 function handleHealth(res) {
   const problems = [
     ...missingEnv(CALL_ENV).map((name) => `missing ${name}`),
-    ...missingEnv(WEBHOOK_ENV).map((name) => `missing ${name}`),
+    ...missingEnv(INGEST_ENV).map((name) => `missing ${name}`),
     ...(config.escalationEnabled
       ? missingEnv(ESCALATION_ENV).map((name) => `escalation enabled but missing ${name}`)
       : []),
@@ -1062,19 +1244,23 @@ async function router(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const route = `${req.method} ${url.pathname}`;
 
-  if (ADMIN_ROUTES.includes(route)) {
-    const auth = adminAuthorised(req);
-    if (!auth.ok) {
-      log('warn', 'request', 'Rejected admin request', {
-        route,
-        ip: clientIp(req),
-        reason: auth.reason,
-      });
-      return sendJson(res, 401, { status: 'error', error: 'unauthorised' });
-    }
+  const auth = ADMIN_ROUTES.includes(route)
+    ? adminAuthorised(req)
+    : DEVICE_ROUTES.includes(route)
+      ? deviceAuthorised(req)
+      : { ok: true };
+  if (!auth.ok) {
+    log('warn', 'request', 'Rejected request', {
+      route,
+      ip: clientIp(req),
+      reason: auth.reason,
+    });
+    return sendJson(res, 401, { status: 'error', error: 'unauthorised' });
   }
 
   switch (route) {
+    case 'POST /ingest':
+      return handleIngest(req, res);
     case 'POST /webhook/terra':
       return handleTerraWebhook(req, res);
     case 'POST /nudge':
@@ -1121,6 +1307,8 @@ function start() {
       cooldownSeconds: config.cooldownSeconds,
       escalationEnabled: config.escalationEnabled,
       adminAuth: process.env.ADMIN_TOKEN ? 'x-admin-token' : 'loopback-only',
+      ingest: process.env.DEVICE_TOKEN ? 'open with x-device-token' : 'closed (DEVICE_TOKEN unset)',
+      shareLocationWithContact: config.shareLocationWithContact,
     });
   });
 }
@@ -1129,14 +1317,15 @@ if (require.main === module) {
   start();
 }
 
-// Out of scope by decision, do not add: Apple Health and Terra's Mobile SDK.
-// Apple Health has no web API and would require an on-device app; all payloads
-// are assumed to arrive from Oura via Terra's server-side integration.
-
 module.exports = {
   loadConfig,
   loadState,
   computeStressScore,
+  computeIngestStressScore,
+  parseLocation,
+  shareableLocation,
+  recordIngest,
+  deviceAuthorised,
   verifyTerraSignature,
   processTerraPayload,
   buildNudgeMessage,

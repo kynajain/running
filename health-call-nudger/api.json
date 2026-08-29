@@ -1,11 +1,13 @@
 {
   "service": "health-call-nudger",
-  "description": "Safety check-in tool for runners. Receives biometric data from Terra webhooks (Oura via Terra's server-side integration) and places a calm outbound phone call via the ElevenLabs Conversational AI Twilio integration when stress indicators spike.",
-  "notAnEmergencyService": "Escalation to an emergency contact exists but is off by default (escalationEnabled). Even when on, Terra's stress score is a recalculated value rather than a live reading, so this is not real-time emergency detection.",
+  "description": "Safety check-in tool for runners. The runner's app pushes health data and live location to POST /ingest, and the service places a calm outbound phone call via the ElevenLabs Conversational AI Twilio integration when stress indicators spike. POST /webhook/terra remains as a legacy path for Terra-delivered Oura data.",
+  "notAnEmergencyService": "Escalation to an emergency contact exists but is off by default (escalationEnabled). Even when on, this is not real-time emergency detection: readings and location fixes can lag the underlying event, and a missed call does not mean something happened.",
   "auth": {
-    "public": ["POST /webhook/terra", "GET /health", "GET /"],
+    "public": ["GET /health", "GET /"],
+    "device": ["POST /ingest"],
+    "legacyPublic": ["POST /webhook/terra (authenticated by Terra signature)"],
     "admin": ["POST /nudge", "POST /test-call", "POST /acknowledge", "PATCH /config"],
-    "scheme": "Admin routes require an x-admin-token header matching ADMIN_TOKEN, compared in constant time. When ADMIN_TOKEN is unset they accept loopback connections only. There is no bypass flag: these routes place real calls to the runner and her emergency contact.",
+    "scheme": "Admin routes require an x-admin-token header matching ADMIN_TOKEN, compared in constant time. When ADMIN_TOKEN is unset they accept loopback connections only. There is no bypass flag: these routes place real calls to the runner and her emergency contact. POST /ingest requires an x-device-token header matching DEVICE_TOKEN — a separate credential so a lost handset can be revoked without revoking operator access — and rejects everything while DEVICE_TOKEN is unset.",
     "rejections": "401 with { status: 'error', error: 'unauthorised' }, logged with source IP"
   },
   "webhookHardening": {
@@ -17,7 +19,30 @@
   "endpoints": [
     {
       "method": "POST",
+      "path": "/ingest",
+      "description": "Primary data path: the runner's app pushes health data and its current location. Requires x-device-token. Rate limited per IP, body capped at 64 KB. A payload with a stress value at or above stressThreshold triggers a check-in call, subject to cooldown; a payload without one only updates last-known state.",
+      "headers": { "x-device-token": "must match DEVICE_TOKEN (required)" },
+      "body": {
+        "stress": "number 0-100 (optional) — the app's own stress value; the only thing that can trigger a call",
+        "heartRate": "number (optional) — stored for inspection, never scored",
+        "hrv": "number (optional) — stored for inspection, never scored",
+        "steps": "number (optional)",
+        "pace": "number (optional)",
+        "context": "string (optional) — short description surfaced in the spoken message",
+        "location": "{ lat, lng, accuracyMeters?, at? } (optional). `at` is the phone's own fix time; without it the arrival time is used. Aliases latitude/longitude are accepted."
+      },
+      "responses": {
+        "200": "{ \"status\": \"ok\", \"score\": number|null, \"location\": boolean, \"nudge\": { \"status\": \"ok\" | \"skipped\", \"reason\"?: \"below_threshold\" | \"cooldown\" | \"no_stress_value\" } }",
+        "400": "{ \"status\": \"error\", \"error\": string } — malformed body, stress or location",
+        "401": "{ \"status\": \"error\", \"error\": \"unauthorised\" }",
+        "413": "{ \"status\": \"error\", \"error\": string } — body over 64 KB",
+        "429": "{ \"status\": \"error\", \"error\": \"rate limit exceeded\" }"
+      }
+    },
+    {
+      "method": "POST",
       "path": "/webhook/terra",
+      "legacy": "superseded by POST /ingest; kept for Terra-delivered Oura data",
       "description": "Terra payload receiver. Verifies the terra-signature header (HMAC-SHA256 over `<timestamp>.<raw body>`, 300s window) before anything else, then acknowledges immediately and processes asynchronously because Terra retries on any non-200. Handles activity, daily and body payloads; idempotent across Terra's resends for the same period.",
       "headers": { "terra-signature": "t=<unix_seconds>,v1=<hex_hmac> (required)" },
       "body": "Terra webhook payload: { type, user: { user_id, provider }, data: [ ... ] }",
@@ -90,7 +115,7 @@
       "path": "/config",
       "description": "Read non-secret config.",
       "responses": {
-        "200": "{ \"stressThreshold\": number, \"cooldownSeconds\": number, \"listenerPort\": number, \"escalationEnabled\": boolean, \"escalationDelaySeconds\": number }"
+        "200": "{ \"stressThreshold\": number, \"cooldownSeconds\": number, \"listenerPort\": number, \"escalationEnabled\": boolean, \"escalationDelaySeconds\": number, \"shareLocationWithContact\": boolean, \"locationMaxAgeSeconds\": number }"
       }
     },
     {
@@ -102,7 +127,9 @@
         "cooldownSeconds": "number (optional)",
         "listenerPort": "number (optional)",
         "escalationEnabled": "boolean (optional) — turning this on means an unanswered check-in will call a third party",
-        "escalationDelaySeconds": "number (optional)"
+        "escalationDelaySeconds": "number (optional)",
+        "shareLocationWithContact": "boolean (optional) — whether the escalation call reads out the runner's last known position",
+        "locationMaxAgeSeconds": "number (optional) — a fix older than this is not read out at all"
       },
       "responses": {
         "200": "{ \"status\": \"ok\", \"config\": object }",
@@ -125,6 +152,7 @@
     "ELEVENLABS_ESCALATION_AGENT_ID (escalation only)",
     "EMERGENCY_CONTACT_NUMBER (escalation only)",
     "EMERGENCY_CONTACT_NAME (escalation only)",
+    "DEVICE_TOKEN (the app's credential for POST /ingest)",
     "ADMIN_TOKEN (shared secret for the admin routes)",
     "BIND_ADDRESS (default 127.0.0.1, 0.0.0.0 in the container)",
     "STATE_PATH (override the state file location)",
@@ -133,9 +161,10 @@
   "escalation": {
     "default": "disabled (escalationEnabled false) — must be switched on deliberately",
     "flow": "unanswered check-in call -> wait escalationDelaySeconds -> re-check whether the runner answered late or hit /acknowledge -> only if still unanswered, one call to EMERGENCY_CONTACT_NUMBER using ELEVENLABS_ESCALATION_AGENT_ID",
-    "rateLimit": "at most one escalation per cooldownSeconds window, however many Terra payloads arrive for the same period",
+    "rateLimit": "at most one escalation per cooldownSeconds window, however many payloads arrive for the same period",
+    "location": "when shareLocationWithContact is true the call reads out the last position the app reported, with its age, and only while that fix is newer than locationMaxAgeSeconds. It is stated as where the phone was, not where she is.",
     "agent": "a separate ElevenLabs agent; the third-party script does not share the runner's persona",
-    "script": "factual and non-alarming: automated check-in, elevated wearable reading, no answer, may well be nothing. It does not claim an emergency or tell the contact to call emergency services.",
+    "script": "factual and non-alarming: automated check-in, elevated reading from the app, no answer, may well be nothing. It does not claim an emergency or tell the contact to call emergency services.",
     "consent": "the contact is called automatically and must have consented in advance",
     "audit": "every attempt, including the ones that never dial, is logged and persisted in state.escalationLog with timestamp, triggering score and outcome"
   },

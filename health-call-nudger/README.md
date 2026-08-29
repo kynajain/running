@@ -1,11 +1,15 @@
 # health-call-nudger
 
-A safety check-in tool for runners. It receives biometric data from
-[Terra](https://docs.tryterra.co) webhooks (Oura, via Terra's server-side integration) and places a
-calm outbound phone call through the
-[ElevenLabs Conversational AI Twilio integration](https://elevenlabs.io/docs/api-reference/twilio/outbound-call)
-when stress indicators spike during or around a run. If the runner does not answer, it can
-optionally call a nominated emergency contact.
+A safety check-in tool for runners. The runner's app pushes health data and its live location to
+`POST /ingest`, and when stress indicators spike the service places a calm outbound phone call
+through the
+[ElevenLabs Conversational AI Twilio integration](https://elevenlabs.io/docs/api-reference/twilio/outbound-call).
+If she does not answer, it can optionally call a nominated emergency contact and read out her last
+known position.
+
+`POST /webhook/terra` still exists as a legacy path for [Terra](https://docs.tryterra.co)-delivered
+Oura data, and works exactly as before; nothing needs to be configured for it if you are not using
+it.
 
 ## Read this before demoing it
 
@@ -13,10 +17,14 @@ optionally call a nominated emergency contact.
 - **Escalation calls a third party automatically.** That person must consent in advance to being
   phoned by an automated system about someone else's wearable data. Escalation is **off by
   default** (`escalationEnabled: false`) and must be switched on deliberately.
-- **Terra's stress score is a recalculated daily value, not a live reading.** Escalations can lag
-  the underlying event by minutes or more, and must not be treated as real-time emergency
-  detection. A call the runner missed does not mean something happened, and something happening
-  does not guarantee a call.
+- **Not real-time emergency detection.** Readings and location fixes are as fresh as the app's last
+  upload, which is not the same as live: a phone in a pocket with a poor signal reports late or not
+  at all. On the legacy Terra path this is worse — Terra's stress score is a recalculated daily
+  value. A call the runner missed does not mean something happened, and something happening does
+  not guarantee a call.
+- **Location is spoken as "where her phone was", with its age**, and a fix older than
+  `locationMaxAgeSeconds` (900) is not read out at all. Set `shareLocationWithContact: false` to
+  keep it out of the call entirely.
 - **With escalation off, an unanswered call contacts nobody.** The service records the miss and
   logs it; that is all.
 
@@ -24,7 +32,7 @@ optionally call a nominated emergency contact.
 
 ```bash
 npm install
-cp .env.example .env   # fill in the ElevenLabs values, the Terra secret, ADMIN_TOKEN
+cp .env.example .env   # ElevenLabs values, DEVICE_TOKEN, ADMIN_TOKEN
 npm start
 ```
 
@@ -39,7 +47,8 @@ startup and reports what's absent.
 | `ELEVENLABS_AGENT_ID` | Conversational AI agent that calls the runner |
 | `ELEVENLABS_PHONE_NUMBER_ID` | ID of the Twilio number linked to the agent |
 | `TO_NUMBER` | The runner's number, E.164 format |
-| `TERRA_SIGNING_SECRET` | Terra webhook signing secret, from the Terra dashboard |
+| `DEVICE_TOKEN` | The app's credential for `POST /ingest` |
+| `TERRA_SIGNING_SECRET` | Legacy Terra webhook signing secret, only if you use that path |
 | `ADMIN_TOKEN` | Shared secret for the admin endpoints (see below) |
 | `ELEVENLABS_ESCALATION_AGENT_ID` | Separate agent used for the escalation call |
 | `EMERGENCY_CONTACT_NUMBER` | Contact's number, E.164 format |
@@ -53,12 +62,16 @@ which ElevenLabs only applies if the matching overrides are enabled on the agent
 
 ## Exposure and auth
 
-Terra delivers to a public HTTPS URL, so this service ends up internet-facing. Only three routes
-are safe to expose:
+The app posts from the runner's phone over the internet, so this service is internet-facing:
 
-| Public | Admin (requires `ADMIN_TOKEN`) |
-| --- | --- |
-| `POST /webhook/terra`, `GET /health`, `GET /` | `POST /nudge`, `POST /test-call`, `POST /acknowledge`, `PATCH /config` |
+| Public | Device (`x-device-token`) | Admin (`x-admin-token`) |
+| --- | --- | --- |
+| `GET /health`, `GET /`, legacy `POST /webhook/terra` (signature-checked) | `POST /ingest` | `POST /nudge`, `POST /test-call`, `POST /acknowledge`, `PATCH /config` |
+
+`DEVICE_TOKEN` is deliberately not `ADMIN_TOKEN`: the phone's credential ships inside an app and
+can leak, and revoking it must not lock the operator out (or vice versa). While `DEVICE_TOKEN` is
+unset, `/ingest` rejects everything. Note that a leaked device token lets someone post fake
+readings and fake positions, which is why it is not the same secret that can place calls.
 
 The admin routes place real phone calls to the runner and her emergency contact, and change who
 gets called. Left open on a public host, `/test-call` alone lets anyone ring either of them
@@ -72,7 +85,25 @@ curl -XPOST localhost:4300/test-call -H "x-admin-token: $ADMIN_TOKEN" -d '{"mess
 `GET /status` and `GET /config` never return secrets, but they do expose call history — put them
 behind the proxy too if the host is public.
 
-### Webhook hardening
+### Ingest and webhook hardening
+
+`POST /ingest` is authenticated before anything is stored, capped at 64 KB, and shares the per-IP
+rate limit below. Only `stress` can trigger a call; `heartRate` and `hrv` are stored for inspection
+and never scored (see Scoring).
+
+```bash
+curl -XPOST https://your-host/ingest -H "x-device-token: $DEVICE_TOKEN" -d '{
+  "stress": 88,
+  "heartRate": 171,
+  "context": "mid-run",
+  "location": { "lat": 51.5072, "lng": -0.1276, "accuracyMeters": 8, "at": "2026-08-29T14:31:00Z" }
+}'
+```
+
+`location.at` is the phone's own fix time and matters: it is what decides whether the position is
+fresh enough to read out on an escalation call. Send it.
+
+On the legacy Terra path:
 
 - Signature verification is strict and runs on the raw body before any parsing. Unsigned, stale
   (outside 300s) or non-matching requests get `401` and never reach the parser.
@@ -88,15 +119,16 @@ behind the proxy too if the host is public.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /webhook/terra` | Terra receiver. Verifies `terra-signature`, then acknowledges immediately and processes in the background. |
+| `POST /ingest` | Primary data path. App-pushed health data and location; a `stress` value at or above the threshold triggers a check-in call. |
+| `POST /webhook/terra` | Legacy Terra receiver. Verifies `terra-signature`, then acknowledges immediately and processes in the background. |
 | `POST /nudge` | Manual trigger, `{ score, context }`. Subject to threshold and cooldown. |
 | `POST /test-call` | `{ message }` → places the call directly, bypassing scoring and cooldown. |
 | `POST /acknowledge` | "I'm fine" — cancels a pending escalation inside its delay window. |
 | `GET /health` | Platform health check: uptime and config validity, independent of call state. |
-| `GET /status` | `nudgeCount`, `lastNudgeAt`, `lastCallOutcome`, `cooldownActive`, escalation state and recent audit entries. |
+| `GET /status` | `nudgeCount`, `lastNudgeAt`, `lastCallOutcome`, `cooldownActive`, `lastVitals`, `lastLocation` (with age), escalation state and recent audit entries. |
 | `GET`/`PATCH /config` | Read/update `stressThreshold`, `cooldownSeconds`, `listenerPort`, `escalationEnabled`, `escalationDelaySeconds` (persisted to `config.json`). Secrets are never exposed or accepted here. |
 
-### Terra webhook behaviour
+### Legacy Terra webhook behaviour
 
 Signature verification follows Terra's own scheme: the `terra-signature` header is
 `t=<unix_seconds>,v1=<hex>`, the signed payload is `` `${t}.${rawBody}` `` hashed with HMAC-SHA256,
@@ -108,8 +140,9 @@ a `null` overwrite a score it already has, and calls at most once per period.
 
 ### Scoring
 
-`computeStressScore()` reads `data_enrichment.stress` from the payload and returns 0-100, or `null`
-to skip. Nothing else is inferred.
+The app decides what "stress" means for its own signals and sends the number; the service takes it
+and nothing else (`computeIngestStressScore()`). On the legacy path, `computeStressScore()` reads
+Terra's `data_enrichment.stress`. Either way `null` means skip.
 
 Deliberately **not** implemented: exertion-aware scoring. Raw heart rate is not a valid stress
 signal for a runner — elevated HR is the expected state mid-run. Real logic needs HRV against a
@@ -130,6 +163,11 @@ When a check-in call to the runner goes unanswered and `escalationEnabled` is tr
 3. Only if she is still unreachable does it place **one** call to `EMERGENCY_CONTACT_NUMBER`, using
    the separate `ELEVENLABS_ESCALATION_AGENT_ID` agent, because the script for a third party is not
    the runner's script and the personas must not be shared.
+
+If `shareLocationWithContact` is on and the app's last fix is newer than `locationMaxAgeSeconds`,
+that call also states the position and how old it is, framed as where her phone was rather than
+where she is. A stale fix is dropped rather than read out; `/status` shows
+`escalation.locationWouldBeShared` so you can see which it would be right now.
 
 At most one escalation happens per `cooldownSeconds` window, however many Terra payloads arrive for
 the same period. A missed escalation call does not escalate further.
@@ -154,8 +192,8 @@ npm start            # binds 127.0.0.1 by default
 npm run tunnel       # ngrok, or cloudflared as a fallback
 ```
 
-`npm run tunnel` prints the public URL and the exact
-`https://…/webhook/terra` callback to paste into the Terra dashboard.
+`npm run tunnel` prints the public URL — point the app's ingest base URL at it (and, on the legacy
+path, paste the `https://…/webhook/terra` callback into the Terra dashboard).
 
 **The tunnel URL changes every time the tunnel restarts** unless you configure a reserved ngrok
 domain or a named Cloudflare tunnel. Each time it changes you must update the callback URL in the
@@ -164,7 +202,7 @@ Terra dashboard, or deliveries will fail silently.
 ### Deployment
 
 ```bash
-cp .env.example .env   # fill in, including ADMIN_TOKEN
+cp .env.example .env   # fill in, including DEVICE_TOKEN and ADMIN_TOKEN
 docker compose up -d --build
 ```
 
@@ -184,7 +222,8 @@ in front:
   `/health`. Set every secret, including `ADMIN_TOKEN`, in the platform's env config — never in the
   image.
 
-Then set the Terra dashboard callback to `https://<your-host>/webhook/terra`.
+Then point the app at `https://<your-host>/ingest` (and, if you still use it, set the Terra
+dashboard callback to `https://<your-host>/webhook/terra`).
 
 ### PM2 (no container)
 

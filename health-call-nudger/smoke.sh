@@ -5,12 +5,14 @@ set -u
 PORT=4399
 SECRET=smoke_signing_secret
 TOKEN=smoke_admin_token
+DEVTOKEN=smoke_device_token
 DIR=$(mktemp -d)
 cp health_call_nudger.js api.json package.json "$DIR/"
 ln -s "$PWD/node_modules" "$DIR/node_modules"
 printf '{"stressThreshold":75,"cooldownSeconds":1800,"listenerPort":%s,"escalationEnabled":false,"escalationDelaySeconds":1}\n' "$PORT" > "$DIR/config.json"
 B="http://127.0.0.1:$PORT"
 A=(-H "x-admin-token: $TOKEN")
+D=(-H "x-device-token: $DEVTOKEN")
 
 # Signs a body the way Terra does: HMAC-SHA256 over "<unix_seconds>.<raw body>".
 sign() {
@@ -31,7 +33,7 @@ post_terra() {
 }
 
 echo "=== boot with NO call env (expect warnings, service still up) ==="
-(cd "$DIR" && env -u ELEVENLABS_API_KEY TERRA_SIGNING_SECRET="$SECRET" ADMIN_TOKEN="$TOKEN" node health_call_nudger.js > boot.log 2>&1 &)
+(cd "$DIR" && env -u ELEVENLABS_API_KEY TERRA_SIGNING_SECRET="$SECRET" ADMIN_TOKEN="$TOKEN" DEVICE_TOKEN="$DEVTOKEN" node health_call_nudger.js > boot.log 2>&1 &)
 sleep 1
 cat "$DIR/boot.log"
 
@@ -47,6 +49,24 @@ done
 printf '  PATCH /config -> '; curl -s -XPATCH "$B/config" -d '{}'
 echo "=== admin route with a WRONG token (expect 401) ==="
 curl -s -XPOST "$B/test-call" -H 'x-admin-token: nope' -d '{"message":"x"}'
+
+echo "=== POST /ingest with NO device token (expect 401) ==="
+curl -s -XPOST "$B/ingest" -d '{"stress":88}'
+echo "=== POST /ingest location only, no stress (expect no_stress_value) ==="
+curl -s -XPOST "$B/ingest" "${D[@]}" -d '{"heartRate":171,"location":{"lat":51.5072,"lng":-0.1276,"accuracyMeters":8}}'
+echo "=== POST /ingest bad location (expect 400) ==="
+curl -s -XPOST "$B/ingest" "${D[@]}" -d '{"location":{"lat":999,"lng":0}}'
+echo "=== POST /ingest stress 40 (expect below_threshold) ==="
+curl -s -XPOST "$B/ingest" "${D[@]}" -d '{"stress":40}'
+echo "=== POST /ingest stress 88 (expect nudge ok, call attempted) ==="
+curl -s -XPOST "$B/ingest" "${D[@]}" -d '{"stress":88,"context":"mid-run","location":{"lat":51.5072,"lng":-0.1276}}'
+sleep 1
+echo "=== POST /ingest stress 92 again (expect cooldown) ==="
+curl -s -XPOST "$B/ingest" "${D[@]}" -d '{"stress":92}'
+
+# Clear the cooldown the ingest call just claimed so the legacy Terra path can
+# be seen to reach the call as well.
+curl -s -o /dev/null -XPATCH "$B/config" "${A[@]}" -d '{"cooldownSeconds":0}'
 
 echo "=== POST /webhook/terra with NO signature (expect 401) ==="
 curl -s -o /dev/null -w "%{http_code}\n" -XPOST "$B/webhook/terra" -d '{}'
@@ -68,6 +88,8 @@ post_terra '{"type":"daily","user":{"user_id":"u1","provider":"OURA"},"data":[{"
 echo "=== POST /webhook/terra unknown type (ignored) ==="
 post_terra '{"type":"sleep","user":{"user_id":"u1"},"data":[{"metadata":{"start_time":"x"},"data_enrichment":{"stress":99}}]}'
 
+curl -s -o /dev/null -XPATCH "$B/config" "${A[@]}" -d '{"cooldownSeconds":1800}'
+
 echo "=== oversized webhook body (expect 413) ==="
 head -c 4000000 /dev/zero | tr '\0' 'a' > "$DIR/big.txt"
 curl -s -o /dev/null -w 'HTTP %{http_code}\n' -XPOST "$B/webhook/terra" \
@@ -80,7 +102,7 @@ done | tail -c 40; echo
 
 echo "=== POST /nudge score=40 (below threshold) ==="; curl -s -XPOST "$B/nudge" "${A[@]}" -d '{"score":40}'
 echo "=== POST /nudge bad score ===";                 curl -s -XPOST "$B/nudge" "${A[@]}" -d '{"score":"high"}'
-echo "=== POST /nudge score=88 (cooldown from webhook call) ==="; curl -s -XPOST "$B/nudge" "${A[@]}" -d '{"score":88}'
+echo "=== POST /nudge score=88 (expect cooldown from the webhook call) ==="; curl -s -XPOST "$B/nudge" "${A[@]}" -d '{"score":88}'
 echo "=== POST /acknowledge ===";                    curl -s -XPOST "$B/acknowledge" "${A[@]}"
 echo "=== POST /test-call (expect 502, stage elevenlabs_call) ==="; curl -s -XPOST "$B/test-call" "${A[@]}" -d '{"message":"test"}'
 echo "=== POST /test-call empty message ===";        curl -s -XPOST "$B/test-call" "${A[@]}" -d '{}'
@@ -125,7 +147,13 @@ echo "=== escalation gating (in-process, no calls placed) ==="
     const second = await svc.handleUnansweredCall({ conversationId: null }, { score: 92 });
     console.log("first ->", first.verdict, "| second ->", second.verdict, second.reason);
 
+    // A fresh fix is spoken with its age; a stale one is dropped entirely.
+    console.log("fresh location shared ->", Boolean(svc.shareableLocation().location));
     console.log("escalation script ->", svc.buildEscalationMessage(88, "Sam"));
+
+    svc.recordIngest({ location: { lat: 51.5, lng: -0.12, at: new Date(Date.now() - 3600e3).toISOString() } });
+    console.log("stale location shared ->", Boolean(svc.shareableLocation().location));
+    console.log("stale script mentions position ->", /latitude/.test(svc.buildEscalationMessage(88, "Sam")));
     process.exit(0);
   })();
 ')
