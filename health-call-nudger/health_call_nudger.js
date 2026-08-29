@@ -47,7 +47,16 @@ const WEBHOOK_RATE_LIMIT = 60;
 const WEBHOOK_RATE_WINDOW_MS = 60 * 1000;
 
 // These place real phone calls or change who gets called. They are never open.
-const ADMIN_ROUTES = ['POST /nudge', 'POST /test-call', 'POST /acknowledge', 'PATCH /config'];
+// /status and /config are in here too: /status carries the runner's coordinates,
+// health readings and call history, which is not public information.
+const ADMIN_ROUTES = [
+  'POST /nudge',
+  'POST /test-call',
+  'POST /acknowledge',
+  'GET /status',
+  'GET /config',
+  'PATCH /config',
+];
 const DEVICE_ROUTES = ['POST /ingest'];
 const MAX_INGEST_BODY_BYTES = 64 * 1024;
 const LOOPBACK_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
@@ -149,6 +158,11 @@ function loadConfig() {
   } else if (!config.escalationEnabled) {
     log('info', 'startup', 'Escalation is disabled; an unanswered call contacts nobody', {
       escalationEnabled: false,
+    });
+  }
+  if (trustProxy() && !process.env.ADMIN_TOKEN) {
+    log('warn', 'startup', 'TRUST_PROXY is set without ADMIN_TOKEN; admin routes are closed entirely, because a proxied request is indistinguishable from a local one', {
+      adminRoutes: ADMIN_ROUTES,
     });
   }
   if (!LOOPBACK_ADDRESSES.has(bindAddress()) && !process.env.ADMIN_TOKEN) {
@@ -413,6 +427,7 @@ function mergeRecord(key, score) {
   state.records[key] = {
     score: effectiveScore,
     called: Boolean(existing && existing.called),
+    callConfirmedAt: (existing && existing.callConfirmedAt) || null,
     updatedAt: new Date().toISOString(),
   };
   pruneRecords();
@@ -425,8 +440,39 @@ function mergeRecord(key, score) {
   };
 }
 
+// `called` is a reservation, not a fact: it stops the resends arriving while we
+// dial from queueing a second call. It becomes a fact once ElevenLabs accepts
+// the call, and is handed back if we learn none was placed.
 function markRecordCalled(key) {
   if (state.records[key]) state.records[key].called = true;
+}
+
+function confirmRecordCall(key) {
+  if (!state.records[key]) return;
+  state.records[key].called = true;
+  state.records[key].callConfirmedAt = new Date().toISOString();
+  saveState();
+}
+
+function releaseRecordCall(key) {
+  if (!state.records[key] || state.records[key].callConfirmedAt) return;
+  state.records[key].called = false;
+  saveState();
+  log('info', 'terra_webhook', 'No call was placed; period is retryable again', { key });
+}
+
+// A restart between reserving and confirming leaves a reservation nothing can
+// resolve, which would discard every later resend for that period.
+function releaseUnconfirmedRecords() {
+  const released = Object.keys(state.records).filter((key) => {
+    const record = state.records[key];
+    if (!record || !record.called || record.callConfirmedAt) return false;
+    record.called = false;
+    return true;
+  });
+  if (released.length === 0) return;
+  saveState();
+  log('info', 'startup', 'Released call reservations left unconfirmed by a restart', { released });
 }
 
 function processTerraPayload(body) {
@@ -472,7 +518,10 @@ function processTerraPayload(body) {
       continue;
     }
 
-    const decision = maybeNudge(merged.effectiveScore, `${type} data from ${key}`);
+    const decision = maybeNudge(merged.effectiveScore, `${type} data from ${key}`, {
+      onCallPlaced: () => confirmRecordCall(key),
+      onCallNotPlaced: () => releaseRecordCall(key),
+    });
     log('info', 'terra_webhook', 'Nudge decision', { key, score: merged.effectiveScore, ...decision });
     if (decision.status === 'ok') {
       markRecordCalled(key);
@@ -707,6 +756,19 @@ async function escalate(trigger) {
 
   await sleep(config.escalationDelaySeconds * 1000);
 
+  // Someone may have switched escalation off during the delay, which is the
+  // clearest possible instruction not to call the contact.
+  if (!config.escalationEnabled) {
+    state.lastEscalationAt = null;
+    saveState();
+    return auditEscalation({
+      verdict: 'cancelled',
+      reason: 'escalation was disabled during the delay',
+      triggeringScore: trigger.score,
+      primaryConversationId: trigger.conversationId || null,
+    });
+  }
+
   const response = await userRespondedSince(claimedAt, trigger.conversationId);
   if (response.responded) {
     // Nobody was called, so release the window for a genuine later miss.
@@ -810,13 +872,22 @@ async function trackCallOutcome(conversationId, trigger = {}) {
     await sleep(OUTCOME_POLL_INTERVAL_MS);
   }
 
-  if (!last || !last.status) {
-    return recordOutcome({
+  // Only a terminal status tells us anything. Running out of polling time, or
+  // losing the ElevenLabs API mid-poll, is not evidence she did not pick up —
+  // and must not be allowed to call her emergency contact.
+  if (!last || (last.status !== 'done' && last.status !== 'failed')) {
+    const outcome = recordOutcome({
       outcome: 'unknown',
       stage: 'call_outcome',
       conversationId,
-      reason: 'conversation status unavailable',
+      role,
+      status: (last && last.status) || null,
+      reason: last
+        ? `conversation still ${last.status} when polling gave up`
+        : 'conversation status unavailable',
     });
+    log('warn', 'call_outcome', 'Call outcome unresolved; not treating it as unanswered', outcome);
+    return outcome;
   }
 
   const metadata = last.metadata || {};
@@ -866,7 +937,7 @@ async function trackCallOutcome(conversationId, trigger = {}) {
   return outcome;
 }
 
-async function deliverNudge(score, context) {
+async function deliverNudge(score, context, hooks = {}) {
   let message;
   try {
     message = buildNudgeMessage(score, context);
@@ -883,6 +954,7 @@ async function deliverNudge(score, context) {
   let result;
   try {
     result = await placeCall(message);
+    if (hooks.onCallPlaced) hooks.onCallPlaced(result);
   } catch (err) {
     const outcome = recordOutcome({
       outcome: 'failed',
@@ -901,11 +973,29 @@ function recordNudge() {
   state.nudgeCount += 1;
   state.lastNudgeAt = new Date().toISOString();
   saveState();
+  return state.lastNudgeAt;
+}
+
+// True only when we know ElevenLabs never took the call: bad configuration, or
+// an outright HTTP rejection. A timeout is ambiguous — the request may have
+// landed — and ambiguity must keep its cooldown slot rather than risk dialling
+// her twice.
+function callProvablyNotPlaced(err) {
+  if (err.stage !== 'elevenlabs_call') return true;
+  const details = err.details || {};
+  return Array.isArray(details.missingEnv) || typeof details.status === 'number';
+}
+
+function releaseNudgeClaim(claimedAt) {
+  if (state.lastNudgeAt !== claimedAt) return false;
+  state.lastNudgeAt = null;
+  saveState();
+  return true;
 }
 
 // Shared by /nudge and the Terra webhook. Claims the cooldown slot before
 // dialing so a slow ElevenLabs response cannot let a second nudge through.
-function maybeNudge(score, context) {
+function maybeNudge(score, context, hooks = {}) {
   if (score < config.stressThreshold) {
     return { status: 'skipped', reason: 'below_threshold' };
   }
@@ -914,9 +1004,19 @@ function maybeNudge(score, context) {
     return { status: 'skipped', reason: 'cooldown', retryAfterSeconds: remaining };
   }
 
-  recordNudge();
-  deliverNudge(score, context).catch(() => {
-    // deliverNudge already recorded the failing stage in lastCallOutcome.
+  const claimedAt = recordNudge();
+  deliverNudge(score, context, hooks).catch((err) => {
+    // deliverNudge already recorded the failing stage in lastCallOutcome. If no
+    // call was placed, hand the slot back rather than suppressing every
+    // check-in for a full cooldown over a missing env var.
+    if (!callProvablyNotPlaced(err)) return;
+    if (releaseNudgeClaim(claimedAt)) {
+      log('info', 'call_outcome', 'No call was placed; released the cooldown slot', {
+        claimedAt,
+        stage: err.stage || 'unknown',
+      });
+    }
+    if (hooks.onCallNotPlaced) hooks.onCallNotPlaced(err);
   });
   return { status: 'ok' };
 }
@@ -934,10 +1034,14 @@ function sendJson(res, statusCode, payload) {
   res.end(body);
 }
 
+function trustProxy() {
+  return process.env.TRUST_PROXY === '1';
+}
+
 // Behind a tunnel or load balancer every request arrives from the proxy, so the
 // per-IP rate limit is only meaningful if we trust its forwarded header.
 function clientIp(req) {
-  if (process.env.TRUST_PROXY === '1') {
+  if (trustProxy()) {
     const forwarded = req.headers['x-forwarded-for'];
     if (typeof forwarded === 'string' && forwarded.trim()) {
       return forwarded.split(',')[0].trim();
@@ -977,10 +1081,16 @@ function deviceAuthorised(req) {
     : { ok: false, reason: 'missing or invalid x-device-token' };
 }
 
-// No dev bypass: without ADMIN_TOKEN these routes are loopback-only.
+// No dev bypass: without ADMIN_TOKEN these routes are loopback-only, and even
+// that is unsafe behind a reverse proxy on the same host, where an internet
+// request arrives from 127.0.0.1 like any local one. TRUST_PROXY says a proxy
+// is in front, so the fallback closes.
 function adminAuthorised(req) {
   const token = process.env.ADMIN_TOKEN;
   if (!token) {
+    if (trustProxy()) {
+      return { ok: false, reason: 'ADMIN_TOKEN is not set and TRUST_PROXY is on; admin routes are closed' };
+    }
     return LOOPBACK_ADDRESSES.has(req.socket.remoteAddress || '')
       ? { ok: true }
       : { ok: false, reason: 'ADMIN_TOKEN is not set; admin routes are loopback-only' };
@@ -1198,6 +1308,10 @@ async function handleConfigPatch(req, res) {
     } else if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
       sendJson(res, 400, { status: 'error', error: `${key} must be a non-negative number` });
       return;
+    } else if (key === 'listenerPort' && (!Number.isInteger(value) || value < 1 || value > 65535)) {
+      // Persisting an unusable port means the next restart dies before serving.
+      sendJson(res, 400, { status: 'error', error: 'listenerPort must be an integer between 1 and 65535' });
+      return;
     }
     next[key] = value;
   }
@@ -1219,6 +1333,9 @@ function handleHealth(res) {
   const problems = [
     ...missingEnv(CALL_ENV).map((name) => `missing ${name}`),
     ...missingEnv(INGEST_ENV).map((name) => `missing ${name}`),
+    ...(!process.env.ADMIN_TOKEN && (trustProxy() || !LOOPBACK_ADDRESSES.has(bindAddress()))
+      ? ['missing ADMIN_TOKEN; admin routes are unreachable on this deployment']
+      : []),
     ...(config.escalationEnabled
       ? missingEnv(ESCALATION_ENV).map((name) => `escalation enabled but missing ${name}`)
       : []),
@@ -1299,6 +1416,7 @@ const server = http.createServer((req, res) => {
 function start() {
   loadConfig();
   loadState();
+  releaseUnconfirmedRecords();
   server.listen(config.listenerPort, bindAddress(), () => {
     log('info', 'startup', 'health-call-nudger listening', {
       bindAddress: bindAddress(),

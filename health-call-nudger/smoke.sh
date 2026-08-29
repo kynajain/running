@@ -39,8 +39,10 @@ cat "$DIR/boot.log"
 
 echo "=== GET / ===";        curl -s "$B/" | head -4
 echo "=== GET /health ===";  curl -s "$B/health"
-echo "=== GET /status ===";  curl -s "$B/status"
-echo "=== GET /config ===";  curl -s "$B/config"
+echo "=== GET /status without a token (expect 401; it carries her location) ==="
+curl -s "$B/status"
+echo "=== GET /status ===";  curl -s "$B/status" "${A[@]}"
+echo "=== GET /config ===";  curl -s "$B/config" "${A[@]}"
 
 echo "=== admin routes without a token (expect 401 unauthorised) ==="
 for route in nudge test-call acknowledge; do
@@ -61,12 +63,9 @@ curl -s -XPOST "$B/ingest" "${D[@]}" -d '{"stress":40}'
 echo "=== POST /ingest stress 88 (expect nudge ok, call attempted) ==="
 curl -s -XPOST "$B/ingest" "${D[@]}" -d '{"stress":88,"context":"mid-run","location":{"lat":51.5072,"lng":-0.1276}}'
 sleep 1
-echo "=== POST /ingest stress 92 again (expect cooldown) ==="
+echo "=== POST /ingest stress 92 again (expect ok: the failed call handed its cooldown slot back) ==="
 curl -s -XPOST "$B/ingest" "${D[@]}" -d '{"stress":92}'
-
-# Clear the cooldown the ingest call just claimed so the legacy Terra path can
-# be seen to reach the call as well.
-curl -s -o /dev/null -XPATCH "$B/config" "${A[@]}" -d '{"cooldownSeconds":0}'
+sleep 1
 
 echo "=== POST /webhook/terra with NO signature (expect 401) ==="
 curl -s -o /dev/null -w "%{http_code}\n" -XPOST "$B/webhook/terra" -d '{}'
@@ -88,8 +87,6 @@ post_terra '{"type":"daily","user":{"user_id":"u1","provider":"OURA"},"data":[{"
 echo "=== POST /webhook/terra unknown type (ignored) ==="
 post_terra '{"type":"sleep","user":{"user_id":"u1"},"data":[{"metadata":{"start_time":"x"},"data_enrichment":{"stress":99}}]}'
 
-curl -s -o /dev/null -XPATCH "$B/config" "${A[@]}" -d '{"cooldownSeconds":1800}'
-
 echo "=== oversized webhook body (expect 413) ==="
 head -c 4000000 /dev/zero | tr '\0' 'a' > "$DIR/big.txt"
 curl -s -o /dev/null -w 'HTTP %{http_code}\n' -XPOST "$B/webhook/terra" \
@@ -102,14 +99,16 @@ done | tail -c 40; echo
 
 echo "=== POST /nudge score=40 (below threshold) ==="; curl -s -XPOST "$B/nudge" "${A[@]}" -d '{"score":40}'
 echo "=== POST /nudge bad score ===";                 curl -s -XPOST "$B/nudge" "${A[@]}" -d '{"score":"high"}'
-echo "=== POST /nudge score=88 (expect cooldown from the webhook call) ==="; curl -s -XPOST "$B/nudge" "${A[@]}" -d '{"score":88}'
+echo "=== POST /nudge score=88 (no credentials here, so no call is ever accepted and the slot stays free) ==="; curl -s -XPOST "$B/nudge" "${A[@]}" -d '{"score":88}'
 echo "=== POST /acknowledge ===";                    curl -s -XPOST "$B/acknowledge" "${A[@]}"
 echo "=== POST /test-call (expect 502, stage elevenlabs_call) ==="; curl -s -XPOST "$B/test-call" "${A[@]}" -d '{"message":"test"}'
 echo "=== POST /test-call empty message ===";        curl -s -XPOST "$B/test-call" "${A[@]}" -d '{}'
 echo "=== PATCH /config ===";                        curl -s -XPATCH "$B/config" "${A[@]}" -d '{"stressThreshold":60,"cooldownSeconds":5}'
 echo "=== PATCH /config rejects secret ===";         curl -s -XPATCH "$B/config" "${A[@]}" -d '{"TERRA_SIGNING_SECRET":"x"}'
 echo "=== PATCH /config escalationEnabled must be boolean ==="; curl -s -XPATCH "$B/config" "${A[@]}" -d '{"escalationEnabled":"yes"}'
-echo "=== GET /status (lastCallOutcome should name the failing stage) ==="; curl -s "$B/status"
+echo "=== PATCH /config fractional listenerPort (expect 400) ==="; curl -s -XPATCH "$B/config" "${A[@]}" -d '{"listenerPort":4300.5}'
+echo "=== PATCH /config listenerPort above 65535 (expect 400) ==="; curl -s -XPATCH "$B/config" "${A[@]}" -d '{"listenerPort":70000}'
+echo "=== GET /status (lastCallOutcome should name the failing stage) ==="; curl -s "$B/status" "${A[@]}"
 echo "=== unknown route ===";                        curl -s "$B/nope"
 echo "=== state.json ===";                           cat "$DIR/state.json"
 pkill -f "health_call_nudger.js" > /dev/null 2>&1
@@ -141,6 +140,16 @@ echo "=== escalation gating (in-process, no calls placed) ==="
     const pending = svc.handleUnansweredCall({ conversationId: null }, { score: 88 });
     svc.acknowledge("smoke");
     console.log("acknowledged ->", (await pending).verdict);
+
+    // Switching escalation off during the delay must cancel the pending call.
+    const inflight = svc.handleUnansweredCall({ conversationId: null }, { score: 89 });
+    cfg.escalationEnabled = false;
+    fs.writeFileSync("config.json", JSON.stringify(cfg));
+    svc.loadConfig();
+    console.log("disabled mid-delay ->", (await inflight).verdict);
+    cfg.escalationEnabled = true;
+    fs.writeFileSync("config.json", JSON.stringify(cfg));
+    svc.loadConfig();
 
     // Second escalation inside the same cooldown window must be refused.
     const first = await svc.handleUnansweredCall({ conversationId: null }, { score: 91 });

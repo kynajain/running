@@ -36,7 +36,7 @@ cp .env.example .env   # ElevenLabs values, DEVICE_TOKEN, ADMIN_TOKEN
 npm start
 ```
 
-The service boots and answers `/health` and `/status` even when env vars are missing; it warns at
+The service boots and answers `/health` even when env vars are missing; it warns at
 startup and reports what's absent.
 
 ### Env
@@ -66,7 +66,7 @@ The app posts from the runner's phone over the internet, so this service is inte
 
 | Public | Device (`x-device-token`) | Admin (`x-admin-token`) |
 | --- | --- | --- |
-| `GET /health`, `GET /`, legacy `POST /webhook/terra` (signature-checked) | `POST /ingest` | `POST /nudge`, `POST /test-call`, `POST /acknowledge`, `PATCH /config` |
+| `GET /health`, `GET /`, legacy `POST /webhook/terra` (signature-checked) | `POST /ingest` | `POST /nudge`, `POST /test-call`, `POST /acknowledge`, `GET /status`, `GET /config`, `PATCH /config` |
 
 `DEVICE_TOKEN` is deliberately not `ADMIN_TOKEN`: the phone's credential ships inside an app and
 can leak, and revoking it must not lock the operator out (or vice versa). While `DEVICE_TOKEN` is
@@ -76,14 +76,18 @@ readings and fake positions, which is why it is not the same secret that can pla
 The admin routes place real phone calls to the runner and her emergency contact, and change who
 gets called. Left open on a public host, `/test-call` alone lets anyone ring either of them
 repeatedly. They require an `x-admin-token` header matching `ADMIN_TOKEN` (compared in constant
-time); when `ADMIN_TOKEN` is unset they only accept loopback connections. There is no bypass flag.
+time); when `ADMIN_TOKEN` is unset they only accept loopback connections, and if `TRUST_PROXY=1`
+they are closed outright — a reverse proxy on the same host makes an internet request arrive from
+127.0.0.1 like any local one, so loopback stops meaning "local". There is no bypass flag. `/health`
+reports a missing `ADMIN_TOKEN` as a problem whenever the deployment is proxied or non-loopback.
 
 ```bash
 curl -XPOST localhost:4300/test-call -H "x-admin-token: $ADMIN_TOKEN" -d '{"message":"test"}'
 ```
 
-`GET /status` and `GET /config` never return secrets, but they do expose call history — put them
-behind the proxy too if the host is public.
+`GET /status` and `GET /config` need the same token: they never return secrets, but `/status`
+carries the runner's coordinates, her readings and her call history. Platform and load-balancer
+probes use `GET /health`, which carries none of that.
 
 ### Ingest and webhook hardening
 
@@ -152,15 +156,27 @@ personal baseline, or HR relative to pace. Do not add raw HR thresholds.
 
 Each call is followed by polling the ElevenLabs conversation until it reaches a terminal state, and
 recorded in `lastCallOutcome` as `answered`, `unanswered`, `failed` or `unknown`, with the `stage`
-reached so a failure names the layer that broke.
+reached so a failure names the layer that broke. Only a terminal ElevenLabs status can produce
+`unanswered`: if polling runs out of time or the API becomes unreadable, the outcome is `unknown`,
+which never escalates. "We could not find out" is not the same as "she did not pick up", and only
+one of the two is allowed to ring a third party.
+
+The `cooldownSeconds` slot is claimed before dialling so concurrent payloads cannot stack up calls,
+and handed back only when we know no call was placed — bad configuration, or an outright rejection
+from ElevenLabs. A timeout keeps the slot, since the request may have landed and a retry would ring
+her twice. Terra periods work the same way: a period marked called is a reservation until a call is
+accepted, so a failure that never reached ElevenLabs leaves the next resend free to retry, and a
+reservation left unconfirmed by a restart is released at boot.
 
 When a check-in call to the runner goes unanswered and `escalationEnabled` is true:
 
 1. The escalation window is claimed immediately, then the service waits `escalationDelaySeconds`
    (default 120).
-2. It re-checks whether the runner turned up in the meantime — either she picked up late, or
+2. It re-checks `escalationEnabled`, so switching escalation off during the delay cancels the
+   pending call instead of letting a timer that started earlier dial anyway.
+3. It re-checks whether the runner turned up in the meantime — either she picked up late, or
    `POST /acknowledge` was called.
-3. Only if she is still unreachable does it place **one** call to `EMERGENCY_CONTACT_NUMBER`, using
+4. Only if she is still unreachable does it place **one** call to `EMERGENCY_CONTACT_NUMBER`, using
    the separate `ELEVENLABS_ESCALATION_AGENT_ID` agent, because the script for a third party is not
    the runner's script and the personas must not be shared.
 

@@ -6,8 +6,8 @@
     "public": ["GET /health", "GET /"],
     "device": ["POST /ingest"],
     "legacyPublic": ["POST /webhook/terra (authenticated by Terra signature)"],
-    "admin": ["POST /nudge", "POST /test-call", "POST /acknowledge", "PATCH /config"],
-    "scheme": "Admin routes require an x-admin-token header matching ADMIN_TOKEN, compared in constant time. When ADMIN_TOKEN is unset they accept loopback connections only. There is no bypass flag: these routes place real calls to the runner and her emergency contact. POST /ingest requires an x-device-token header matching DEVICE_TOKEN — a separate credential so a lost handset can be revoked without revoking operator access — and rejects everything while DEVICE_TOKEN is unset.",
+    "admin": ["POST /nudge", "POST /test-call", "POST /acknowledge", "GET /status", "GET /config", "PATCH /config"],
+    "scheme": "Admin routes require an x-admin-token header matching ADMIN_TOKEN, compared in constant time. When ADMIN_TOKEN is unset they accept loopback connections only, and are closed entirely if TRUST_PROXY=1, because a proxy on the same host makes an internet request look local. GET /status and GET /config are admin routes: /status carries the runner's position, readings and call history. Platform probes use GET /health. There is no bypass flag: these routes place real calls to the runner and her emergency contact. POST /ingest requires an x-device-token header matching DEVICE_TOKEN — a separate credential so a lost handset can be revoked without revoking operator access — and rejects everything while DEVICE_TOKEN is unset.",
     "rejections": "401 with { status: 'error', error: 'unauthorised' }, logged with source IP"
   },
   "webhookHardening": {
@@ -121,11 +121,11 @@
     {
       "method": "PATCH",
       "path": "/config",
-      "description": "Update non-secret config and persist to config.json. Secrets are never readable or writable here; any other key is rejected. listenerPort changes take effect on restart.",
+      "description": "Update non-secret config and persist to config.json. Secrets are never readable or writable here; any other key is rejected. listenerPort changes take effect on restart, so it must be an integer between 1 and 65535 — an unusable value would be persisted and kill the next boot.",
       "body": {
         "stressThreshold": "number (optional)",
         "cooldownSeconds": "number (optional)",
-        "listenerPort": "number (optional)",
+        "listenerPort": "integer 1-65535 (optional)",
         "escalationEnabled": "boolean (optional) — turning this on means an unanswered check-in will call a third party",
         "escalationDelaySeconds": "number (optional)",
         "shareLocationWithContact": "boolean (optional) — whether the escalation call reads out the runner's last known position",
